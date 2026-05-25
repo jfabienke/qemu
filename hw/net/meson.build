@@ -21,6 +21,12 @@ system_ss.add(when: 'CONFIG_SMC91C111', if_true: files('smc91c111.c'))
 system_ss.add(when: 'CONFIG_LAN9118', if_true: files('lan9118.c'))
 system_ss.add(when: 'CONFIG_LAN9118_PHY', if_true: files('lan9118_phy.c'))
 system_ss.add(when: 'CONFIG_NE2000_ISA', if_true: files('ne2000-isa.c'))
+
+# elink-qemu: 3Com EtherLink emulation
+system_ss.add(when: 'CONFIG_EL3_509', if_true: files('3c509.c', '3c509-idport.c', 'el3_core.c'))
+system_ss.add(when: 'CONFIG_EL3_515', if_true: files('3c515.c', 'el3_core.c'))
+system_ss.add(when: 'CONFIG_EL3_59X', if_true: files('3c59x.c', 'el3_core.c'))
+
 system_ss.add(when: 'CONFIG_OPENCORES_ETH', if_true: files('opencores_eth.c'))
 system_ss.add(when: 'CONFIG_XGMAC', if_true: files('xgmac.c'))
 system_ss.add(when: 'CONFIG_MIPSNET', if_true: files('mipsnet.c'))

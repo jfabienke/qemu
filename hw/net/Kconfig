@@ -130,6 +130,28 @@ config VIRTIO_NET
     default y
     depends on VIRTIO
 
+# elink-qemu: 3Com EtherLink network adapters
+config EL3_CORE
+    bool
+
+config EL3_509
+    bool
+    default y if ISA_BUS
+    depends on ISA_BUS
+    select EL3_CORE
+
+config EL3_515
+    bool
+    default y if ISA_BUS
+    depends on ISA_BUS
+    select EL3_CORE
+
+config EL3_59X
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EL3_CORE
+
 config ETSEC
     bool
     select PTIMER
@@ -163,3 +185,25 @@ config CAN_CTUCANFD_PCI
     default y if PCI_DEVICES
     depends on PCI && CAN_CTUCANFD
     select CAN_BUS
+
+# elink-qemu: 3Com EtherLink network adapters
+config EL3_CORE
+    bool
+
+config EL3_509
+    bool
+    default y if ISA_BUS
+    depends on ISA_BUS
+    select EL3_CORE
+
+config EL3_515
+    bool
+    default y if ISA_BUS
+    depends on ISA_BUS
+    select EL3_CORE
+
+config EL3_59X
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EL3_CORE
