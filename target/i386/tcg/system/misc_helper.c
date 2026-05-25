@@ -27,41 +27,51 @@
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
 #include "hw/i386/apic.h"
+#include "exec/icount.h"
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
     address_space_stb(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(1);  /* model ISA bus access time (-icount isa_mhz/isa_bus) */
 }
 
 target_ulong helper_inb(CPUX86State *env, uint32_t port)
 {
-    return address_space_ldub(&address_space_io, port,
-                              cpu_get_mem_attrs(env), NULL);
+    uint8_t val = address_space_ldub(&address_space_io, port,
+                                     cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(1);
+    return val;
 }
 
 void helper_outw(CPUX86State *env, uint32_t port, uint32_t data)
 {
     address_space_stw(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(2);
 }
 
 target_ulong helper_inw(CPUX86State *env, uint32_t port)
 {
-    return address_space_lduw(&address_space_io, port,
-                              cpu_get_mem_attrs(env), NULL);
+    uint16_t val = address_space_lduw(&address_space_io, port,
+                                      cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(2);
+    return val;
 }
 
 void helper_outl(CPUX86State *env, uint32_t port, uint32_t data)
 {
     address_space_stl(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(4);
 }
 
 target_ulong helper_inl(CPUX86State *env, uint32_t port)
 {
-    return address_space_ldl(&address_space_io, port,
-                             cpu_get_mem_attrs(env), NULL);
+    uint32_t val = address_space_ldl(&address_space_io, port,
+                                     cpu_get_mem_attrs(env), NULL);
+    icount_charge_io_latency(4);
+    return val;
 }
 
 target_ulong helper_read_cr8(CPUX86State *env)

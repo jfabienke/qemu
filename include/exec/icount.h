@@ -65,6 +65,11 @@ int64_t icount_to_ns(int64_t icount);
  */
 bool icount_configure(QemuOpts *opts, Error **errp);
 
+/* Charge an ISA bus I/O access to the virtual clock (the -icount "isa_mhz"/"isa_bus" options).
+ * @bytes is the access width; on an 8-bit bus a wider access costs multiple transfers. Called
+ * from the target in/out helpers so ISA I/O is paced at the bus rate, not the CPU rate. */
+void icount_charge_io_latency(unsigned bytes);
+
 /* used by tcg vcpu thread to calc icount budget */
 int64_t icount_round(int64_t count);
 

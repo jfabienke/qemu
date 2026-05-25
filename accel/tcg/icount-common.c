@@ -45,8 +45,17 @@
  * is TCG-specific, and does not need to be built for other accels.
  */
 static bool icount_sleep = true;
-/* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
-#define MAX_ICOUNT_SHIFT 10
+/* Min modeled CPU speed: 2^12 ns/insn ~= 0.24 MIPS (covers a 4.77 MHz 8088 at shift=11). */
+#define MAX_ICOUNT_SHIFT 12
+
+/* ISA bus I/O timing (the -icount "isa_mhz" / "isa_bus" sub-options). Each guest port access
+ * advances the virtual clock by the time the ISA bus takes, decoupling slow (wait-stated) ISA
+ * I/O from the CPU instruction rate -- which a single icount shift cannot express. A byte
+ * access is one bus transfer; a wider access on an 8-bit bus (e.g. a 16-bit OUT on an XT) is
+ * split into multiple transfers. isa_mhz accepts a float (e.g. 4.77 for an 8088). 0 = off. */
+#define ISA_IO_CYCLES 8                 /* bus clocks per transfer (8 -> ~1 us at 8 MHz) */
+static int64_t icount_isa_xfer_ns;      /* virtual ns per ISA bus transfer (0 = disabled) */
+static int icount_isa_bus_bytes = 2;    /* bus width in bytes: 1 = 8-bit (XT), 2 = 16-bit (AT) */
 
 bool icount_align_option;
 
@@ -416,6 +425,28 @@ void icount_account_warp_timer(void)
     icount_warp_rt();
 }
 
+/* Advance the virtual clock by one ISA I/O cycle, modeling the ISA bus wait-states a guest
+ * port access incurs (independent of the CPU instruction rate). Called from the i386 in/out
+ * helpers. No-op unless the -icount "isa_mhz" sub-option set a latency. Runs on the vCPU
+ * thread under the BQL during I/O, same as the periodic icount_adjust bias update. */
+void icount_charge_io_latency(unsigned bytes)
+{
+    int64_t ns;
+
+    if (!icount_isa_xfer_ns) {
+        return;
+    }
+    /* an N-byte access is ceil(N / bus-width) bus transfers (8-bit bus splits wider accesses) */
+    ns = icount_isa_xfer_ns *
+         ((bytes + icount_isa_bus_bytes - 1) / icount_isa_bus_bytes);
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    qatomic_set_i64(&timers_state.qemu_icount_bias,
+                    qatomic_read_i64(&timers_state.qemu_icount_bias) + ns);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
 bool icount_configure(QemuOpts *opts, Error **errp)
 {
     const char *option = qemu_opt_get(opts, "shift");
@@ -448,6 +479,27 @@ bool icount_configure(QemuOpts *opts, Error **errp)
     } else if (!icount_sleep) {
         error_setg(errp, "shift=auto and sleep=off are incompatible");
         return false;
+    }
+
+    /* ISA bus timing: charge each guest port access the time the ISA bus takes. Needs a fixed
+     * shift -- adaptive (shift=auto) mode recomputes the bias and would clobber the charges. */
+    {
+        const char *mhz_opt = qemu_opt_get(opts, "isa_mhz");
+        if (mhz_opt) {
+            double mhz;
+            uint64_t bus;
+            if (time_shift < 0) {
+                error_setg(errp, "icount: isa_mhz requires a fixed shift (not auto)");
+                return false;
+            }
+            if (qemu_strtod(mhz_opt, NULL, &mhz) < 0 || mhz <= 0) {
+                error_setg(errp, "icount: invalid isa_mhz value");
+                return false;
+            }
+            icount_isa_xfer_ns = (int64_t)((ISA_IO_CYCLES * 1000.0) / mhz + 0.5);
+            bus = qemu_opt_get_number(opts, "isa_bus", 16);
+            icount_isa_bus_bytes = (bus <= 8) ? 1 : 2;
+        }
     }
 
     icount_sleep = sleep;
