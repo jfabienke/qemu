@@ -20,3 +20,9 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+# elink-qemu fork: dev cruft
+*.log
+*.orig
+*.rej
+*.bak
+/mnt/
