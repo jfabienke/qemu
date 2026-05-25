@@ -76,6 +76,11 @@ config SM501
     select SERIAL_MM
     select USB_OHCI_SYSBUS
 
+config MATROX_PARHELIA_STUB
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+
 config TCX
     bool
 
