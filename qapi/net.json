@@ -833,6 +833,21 @@
     '*remote': 'SocketAddress' } }
 
 ##
+# @NetdevTcpsinkOptions:
+#
+# A deterministic in-emulator TCP sink (runs on the guest's virtual clock): answers ARP,
+# completes a passive TCP open, ACKs all received data, and answers FIN. Unlike slirp it can
+# advertise an arbitrary MSS, enabling FDDI-sized MSS experiments with no real-time host peer.
+#
+# @mss: TCP MSS to advertise to the guest (default 1460).
+#
+# Since: 10.1
+##
+{ 'struct': 'NetdevTcpsinkOptions',
+  'data': {
+    '*mss': 'uint16' } }
+
+##
 # @NetClientDriver:
 #
 # Available netdev drivers.
@@ -859,7 +874,7 @@
 ##
 { 'enum': 'NetClientDriver',
   'data': [ 'none', 'nic', 'user', 'tap', 'l2tpv3', 'socket', 'stream',
-            'dgram', 'vde', 'bridge', 'hubport', 'netmap', 'vhost-user',
+            'dgram', 'tcpsink', 'vde', 'bridge', 'hubport', 'netmap', 'vhost-user',
             'vhost-vdpa',
             { 'name': 'passt', 'if': 'CONFIG_PASST' },
             { 'name': 'af-xdp', 'if': 'CONFIG_AF_XDP' },
@@ -891,6 +906,7 @@
     'socket':   'NetdevSocketOptions',
     'stream':   'NetdevStreamOptions',
     'dgram':    'NetdevDgramOptions',
+    'tcpsink':  'NetdevTcpsinkOptions',
     'vde':      'NetdevVdeOptions',
     'bridge':   'NetdevBridgeOptions',
     'hubport':  'NetdevHubPortOptions',

@@ -1267,6 +1267,7 @@ static int (* const net_client_init_fun[NET_CLIENT_DRIVER__MAX])(
         [NET_CLIENT_DRIVER_SOCKET]    = net_init_socket,
         [NET_CLIENT_DRIVER_STREAM]    = net_init_stream,
         [NET_CLIENT_DRIVER_DGRAM]     = net_init_dgram,
+        [NET_CLIENT_DRIVER_TCPSINK]   = net_init_tcpsink,
 #ifdef CONFIG_VDE
         [NET_CLIENT_DRIVER_VDE]       = net_init_vde,
 #endif

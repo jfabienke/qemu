@@ -50,6 +50,9 @@ int net_init_stream(const Netdev *netdev, const char *name,
 int net_init_dgram(const Netdev *netdev, const char *name,
                    NetClientState *peer, Error **errp);
 
+int net_init_tcpsink(const Netdev *netdev, const char *name,
+                     NetClientState *peer, Error **errp);
+
 int net_init_tap(const Netdev *netdev, const char *name,
                  NetClientState *peer, Error **errp);
 

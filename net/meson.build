@@ -14,6 +14,7 @@ system_ss.add(files(
   'socket.c',
   'stream.c',
   'stream_data.c',
+  'tcpsink.c',
   'util.c',
 ))
 
