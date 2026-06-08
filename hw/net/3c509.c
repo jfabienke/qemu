@@ -110,6 +110,11 @@ static const EL3VariantOps isa_3c509_ops = {
 static NetClientInfo net_3c509_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
+    /* Backpressure RX (match the 3c515 path): queue at send time when the RX FIFO can't hold
+     * another max frame instead of dropping host-speed slirp bursts on overflow. NOTE: slirp's
+     * no-callback send can still drop on the net-queue flush path, so this reduces but does not
+     * eliminate burst loss. */
+    .can_receive = el3_core_can_receive,
     .receive = el3_core_receive,
     .link_status_changed = el3_core_set_link_status,
 };
