@@ -389,6 +389,7 @@ static void el3_process_command(EL3Core *c, uint16_t cmd)
         c->current_tx_written = 0;
         c->tx_preamble_pos = 0;
         c->tx_drain_deadline_ns = 0;
+        c->dn_pend_n = 0;            /* TxReset discards in-flight paced DOWN completions */
         c->tx_occupancy = 0;
         c->tx_wire_active = false;
         c->tx_avail_armed = false;   /* TxReset resets thresholds to disabled (tech ref) */
@@ -542,6 +543,41 @@ static void el3_tx_drain_advance(EL3Core *c);
 static void el3_tx_drain_timer_cb(void *opaque)
 {
     EL3Core *c = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int completed = 0;
+
+    /* Paced bus-master DOWN completions: write back DN_COMPLETE for every pending descriptor
+     * whose modeled transfer deadline has passed (the status dword only -- offset +4 -- so the
+     * driver-owned next/addr/len fields are untouched), then raise TxComplete once for the
+     * batch. While entries remain, the timer belongs to the next pending deadline. */
+    while (c->dn_pend_n > 0 && c->dn_pend[0].due_ns <= now) {
+        if (c->dma_as) {
+            uint32_t st = c->dn_pend[0].status;
+            address_space_write(c->dma_as, c->dn_pend[0].addr + 4,
+                                MEMTXATTRS_UNSPECIFIED, &st, sizeof(st));
+        }
+        c->dn_pend_n--;
+        memmove(&c->dn_pend[0], &c->dn_pend[1],
+                (size_t)c->dn_pend_n * sizeof(c->dn_pend[0]));
+        completed++;
+    }
+    if (completed) {
+        c->tx_status = TX_STAT_COMPLETE;
+        c->status |= STAT_TX_COMPLETE;
+        c->int_status |= STAT_TX_COMPLETE;
+        if (c->int_mask & STAT_TX_COMPLETE) {
+            c->pt.tx_complete_irqs++;
+        }
+        el3_update_irq(c);
+    }
+    if (c->dn_pend_n > 0) {
+        timer_mod_ns(c->tx_timer, c->dn_pend[0].due_ns);
+        return;
+    }
+    if (completed) {
+        c->tx_in_progress = false;
+        return;
+    }
 
     el3_tx_drain_advance(c);
     if (c->tx_occupancy > 0) {
@@ -1532,22 +1568,32 @@ void el3_core_dma_tx_single(EL3Core *c, AddressSpace *as, hwaddr desc_addr)
         c->stats.tx_frames_ok++;
         c->stats.tx_bytes_ok += len;
     }
-    /* mark the descriptor complete (the card consumed it) */
     d.status |= EL3_DESC_DOWN_COMPLETE;
-    address_space_write(as, desc_addr, MEMTXATTRS_UNSPECIFIED, &d, sizeof(d));
 
-    if (c->realtiming) {
-        /* defer TxComplete/IRQ by the modeled transfer time (slower of wire vs bus rate) */
+    if (c->realtiming && c->dn_pend_n < EL3_DN_PEND_MAX) {
+        /* Pace the WHOLE completion -- descriptor DN_COMPLETE write-back AND TxComplete/IRQ --
+         * to the modeled transfer time (slower of wire vs bus rate), like real hardware sets
+         * DN_COMPLETE when the DMA actually finishes. Writing the descriptor synchronously here
+         * let descriptor-polling drivers retire + re-kick at CPU speed, bypassing the pacing
+         * entirely (a 10 Mbit link measured 19.8 Mbit). el3_tx_drain_timer_cb completes each
+         * pending entry at its own deadline. */
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         int64_t base = (c->tx_drain_deadline_ns > now) ? c->tx_drain_deadline_ns : now;
         int64_t bus_ns_per_byte = c->dma_rate_bps ? (1000000000LL / c->dma_rate_bps) : 0;
         int64_t per_byte = (bus_ns_per_byte > c->tx_ns_per_byte)
                            ? bus_ns_per_byte : c->tx_ns_per_byte;
         c->tx_drain_deadline_ns = base + (int64_t)len * per_byte;
+        c->dn_pend[c->dn_pend_n].addr   = desc_addr;
+        c->dn_pend[c->dn_pend_n].status = d.status;
+        c->dn_pend[c->dn_pend_n].due_ns = c->tx_drain_deadline_ns;
+        c->dn_pend_n++;
         c->tx_in_progress = true;
-        timer_mod_ns(c->tx_timer, c->tx_drain_deadline_ns);
-        /* el3_tx_drain_timer_cb raises STAT_TX_COMPLETE + IRQ at the deadline */
+        /* arm for the EARLIEST pending completion (entries are deadline-ordered) */
+        timer_mod_ns(c->tx_timer, c->dn_pend[0].due_ns);
     } else {
+        /* non-realtiming (or pend table full -- shouldn't happen with a 4-deep driver ring):
+         * complete synchronously */
+        address_space_write(as, desc_addr, MEMTXATTRS_UNSPECIFIED, &d, sizeof(d));
         c->status |= STAT_TX_COMPLETE;
         c->int_status |= STAT_TX_COMPLETE;
         el3_update_irq(c);
@@ -1893,6 +1939,7 @@ void el3_core_init(EL3Core *c, EL3Model model, const EL3VariantOps *ops)
     c->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, el3_tx_drain_timer_cb, c);
     c->cmd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, el3_cmd_timer_cb, c);
     c->tx_drain_deadline_ns = 0;
+    c->dn_pend_n = 0;
     if (c->tx_ns_per_byte == 0) {
         c->tx_ns_per_byte = 800;   /* 10BaseT: ~1.25 MB/s -> 800 ns/byte */
     }

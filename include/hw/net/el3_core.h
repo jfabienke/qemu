@@ -669,6 +669,20 @@ struct EL3Core {
     uint32_t tx_ns_per_byte;     /* wire time per byte (10BaseT = 800 ns) */
     int64_t tx_drain_deadline_ns;/* virtual-clock time when the TX FIFO finishes draining */
     QEMUTimer *tx_timer;         /* fires at the drain deadline -> TxComplete + IRQ */
+    /* Realtiming bus-master DOWN completions: the descriptor DN_COMPLETE write-back is PACED to
+     * the modeled transfer deadline (real HW sets it when the DMA actually finishes). Writing it
+     * synchronously at StartDmaDown let descriptor-polling drivers retire + re-kick at CPU speed,
+     * bypassing the wire/bus pacing entirely (a 10 Mbit link measured 19.8 Mbit). Each pending
+     * entry completes (write-back + TxComplete latch) in el3_tx_drain_timer_cb at its own due
+     * time. Not in vmstate: an in-flight paced completion lost across snapshot just means the
+     * driver re-kicks -- acceptable for this test device. */
+#define EL3_DN_PEND_MAX 8
+    struct {
+        uint64_t addr;           /* descriptor guest-phys address */
+        uint32_t status;         /* status dword to write back (DN_COMPLETE set) */
+        int64_t due_ns;          /* this transfer's accumulated wire/bus deadline */
+    } dn_pend[EL3_DN_PEND_MAX];
+    int dn_pend_n;
     /* Streaming TX: the FIFO drains at wire rate while the driver fills it, so TxFree falls as
      * bytes are written and rises as they drain. This lets interrupt-driven chunked drivers
      * (e.g. 3Com's 3C5X9PD, which writes the frame in [0x2fc]-byte slices) pace correctly and
