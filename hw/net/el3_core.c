@@ -92,7 +92,7 @@
 #endif
 /* Stage 2 large-frame (FDDI-sized) ceiling: 4 KB NVMe page + IP/TCP/NVMe-TCP headers + slack.
  * The bus-master parts support <=4494 B via allowLargePackets; size the DMA staging buffer for it.
- * (Spike/2b: TX path only for now; proper allowLargePackets gating + RX-FIFO growth to follow.) */
+ * (Stage 2b: TX staging, RX-FIFO growth, and allowLargePackets RX gating are all landed.) */
 #define EL3_LARGE_FRAME_MAX 4608
 #ifndef ETH_MIN_DATA_NOFCS
 #define ETH_MIN_DATA_NOFCS 46
@@ -368,6 +368,10 @@ static void el3_process_command(EL3Core *c, uint16_t cmd)
             }
             
             trace_el3_rx_discard(pkt->length);
+            /* freed a FIFO slot -> let the net core re-deliver any RX it queued while we were
+             * full (see el3_core_can_receive). FIFO data reads already flush; this covers the
+             * rx_packet_count slot freeing too. */
+            qemu_flush_queued_packets(qemu_get_queue(c->nic));
         }
         break;
         
@@ -942,26 +946,16 @@ static void el3_tx_drain_advance(EL3Core *c)
     }
 }
 
-/* PIO TX FIFO capacity. Gated on allowLargePackets so normal operation is byte-identical to the
- * 2 KB FIFO, but an FDDI-sized frame (allowLargePackets set) gets a FIFO that can hold it -- the
- * store-and-forward PIO model can't transmit until tx_fifo_used >= the frame length. */
-static inline uint16_t el3_tx_fifo_cap(const EL3Core *c)
-{
-    return (c->windows[3][W3_MAC_CONTROL >> 1] & MAC_CTRL_ALLOW_LARGE)
-           ? EL3_LARGE_FRAME_MAX : TX_FIFO_SIZE;
-}
-
 /* Get TX FIFO free space. In realtiming mode this reflects the live FIFO occupancy (bytes
  * written minus bytes drained at wire rate) -- so the driver's TxFree guard waits when it
  * fills faster than the link drains, and TxAvailable does not fire spuriously mid-frame. */
 uint16_t el3_get_tx_free(EL3Core *c)
 {
-    uint16_t cap = el3_tx_fifo_cap(c);
     if (c->realtiming && c->tx_ns_per_byte) {
         el3_tx_drain_advance(c);
-        return (c->tx_occupancy >= cap) ? 0 : (cap - c->tx_occupancy);
+        return (c->tx_occupancy >= TX_FIFO_SIZE) ? 0 : (TX_FIFO_SIZE - c->tx_occupancy);
     }
-    return cap - c->tx_fifo_used;
+    return TX_FIFO_SIZE - c->tx_fifo_used;
 }
 
 /* Get RX FIFO free space */
@@ -1021,6 +1015,28 @@ static bool el3_core_dma_rx_single(EL3Core *c, const uint8_t *buf, size_t len)
 }
 
 /* Network receive handler */
+/* Net-layer RX flow control. Returning false makes QEMU's net core QUEUE the packet and retry
+ * later (via qemu_flush_queued_packets, called on FIFO drain) instead of handing it to .receive
+ * and having us drop it on overflow (return -1). Without this, slirp logs "Failed to send packet"
+ * on every overflow and the peer retransmits -- which collapsed NVMe-read throughput (~20 KB/s)
+ * even though the datapath is fast. We only backpressure when the FIFO genuinely can't hold the
+ * next max-size frame; while RX is disabled we let .receive drop (returning false would queue
+ * unboundedly with no drain). */
+bool el3_core_can_receive(NetClientState *nc)
+{
+    EL3Core *c = qemu_get_nic_opaque(nc);
+    if (!c->rx_enabled) {
+        return true;
+    }
+    if (c->rx_packet_count >= RX_MAX_PACKETS) {
+        return false;
+    }
+    if (c->rx_data_used + el3_rx_oversize_max(c) > RX_FIFO_SIZE) {
+        return false;
+    }
+    return true;
+}
+
 ssize_t el3_core_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     EL3Core *c = qemu_get_nic_opaque(nc);
@@ -1046,7 +1062,7 @@ ssize_t el3_core_receive(NetClientState *nc, const uint8_t *buf, size_t size)
             return size;
         }
     }
-    
+
     if (size > el3_rx_oversize_max(c)) {
         /* Oversize frame */
         c->stats.rx_overruns++;
@@ -1091,19 +1107,24 @@ ssize_t el3_core_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     
     /* PIO mode - store in RX FIFO */
     
-    /* Check if packet queue is full */
+    /* No room (packet queue or data FIFO): return 0 = "busy, requeue and retry later", NOT -1
+     * ("consumed") -- the net core's flush path (qemu_flush_queued_packets after the driver's
+     * RX_DISCARD) delivers queued packets WITHOUT re-checking .can_receive, so a -1 here silently
+     * dropped any queued frame that didn't fit the partially-drained FIFO. One dropped frame
+     * forces the in-order guest TCP to dup-ACK away the rest of the window and the slirp peer
+     * (no fast retransmit) recovers only via its ~1.5 s RTO -- the NVMe-read cliff. Returning 0
+     * keeps the frame queued; every RX_DISCARD frees space and re-flushes, so delivery resumes
+     * in order with no loss. (.can_receive still gates fresh sends, bounding the queue.) */
     if (c->rx_packet_count >= RX_MAX_PACKETS) {
-        c->stats.rx_overruns++;
         trace_el3_rx_overflow(size, RX_FIFO_SIZE - c->rx_data_used);
-        return -1;  /* No room */
+        return 0;   /* busy: net core requeues + retries on next flush */
     }
-    
+
     /* Check if data buffer has space */
     uint16_t space_needed = size;
     if (c->rx_data_used + space_needed > RX_FIFO_SIZE) {
-        c->stats.rx_overruns++;
         trace_el3_rx_overflow(size, RX_FIFO_SIZE - c->rx_data_used);
-        return -1;  /* No room */
+        return 0;   /* busy: net core requeues + retries on next flush */
     }
     
     /* Get next packet descriptor */
@@ -1221,23 +1242,22 @@ static void el3_tx_bh_handler(void *opaque)
     
     if (c->current_tx_len > 0 && c->tx_fifo_used >= c->current_tx_len) {
         /* We have a complete frame ready to transmit */
-        uint8_t buf[EL3_LARGE_FRAME_MAX];
-        uint16_t cap = el3_tx_fifo_cap(c);
+        uint8_t buf[ETH_MAX_FRAME_LEN];
         uint16_t len = c->current_tx_len;
-
+        
         /* Sanity check length */
         if (len > sizeof(buf)) {
             trace_el3_tx_oversize(len);
             len = sizeof(buf);
         }
-
+        
         /* Extract frame from TX FIFO */
         for (uint16_t i = 0; i < len; i++) {
-            buf[i] = c->tx_fifo[(c->tx_fifo_read_ptr + i) % cap];
+            buf[i] = c->tx_fifo[(c->tx_fifo_read_ptr + i) % TX_FIFO_SIZE];
         }
-
+        
         /* Update FIFO pointers */
-        c->tx_fifo_read_ptr = (c->tx_fifo_read_ptr + len) % cap;
+        c->tx_fifo_read_ptr = (c->tx_fifo_read_ptr + len) % TX_FIFO_SIZE;
         c->tx_fifo_used -= len;
         
         /* Clear TX state */
@@ -1461,8 +1481,7 @@ uint32_t el3_core_register_read(EL3Core *c, unsigned win, unsigned off, unsigned
  * frame to the netdev now and schedule TxComplete for when the FIFO finishes draining. */
 static void el3_tx_emit_realtiming(EL3Core *c)
 {
-    uint8_t buf[EL3_LARGE_FRAME_MAX];
-    uint16_t cap = el3_tx_fifo_cap(c);
+    uint8_t buf[ETH_MAX_FRAME_LEN];
     uint16_t len = c->current_tx_len;
     if (len == 0 || c->tx_fifo_used < len) {
         return;
@@ -1471,7 +1490,7 @@ static void el3_tx_emit_realtiming(EL3Core *c)
         len = sizeof(buf);
     }
     for (uint16_t i = 0; i < len; i++) {
-        buf[i] = c->tx_fifo[(c->tx_fifo_read_ptr + i) % cap];
+        buf[i] = c->tx_fifo[(c->tx_fifo_read_ptr + i) % TX_FIFO_SIZE];
     }
     /* the assembly buffer is free again for the next frame; tx_occupancy keeps draining */
     c->tx_fifo_read_ptr = 0;
@@ -1655,8 +1674,9 @@ void el3_core_register_write(EL3Core *c, unsigned win, unsigned off,
              * frame length, word 1 is zero -- then the frame bytes. Parse the preamble, then
              * collect exactly current_tx_len data bytes (preamble stripped) and hand the
              * complete frame to the TX path. Bytes are fed one at a time so 8-, 16- and 32-bit
-             * writes are handled uniformly -- 386+ drivers (e.g. 3Com's 3C5X9PD) stream the
-             * FIFO with 32-bit `rep outsd`, so size==4 must feed all four bytes here. */
+             * writes are handled uniformly -- 386+ drivers (3Com 3C5X9PD, and our own driver's
+             * 386 fragment) stream the FIFO with 32-bit `rep outsd`, so size==4 must feed all
+             * four bytes here. */
             if (!c->tx_enabled) {
                 c->tx_status |= TX_STAT_UNDERRUN;
                 c->stats.tx_underruns++;
@@ -1691,9 +1711,9 @@ void el3_core_register_write(EL3Core *c, unsigned win, unsigned off,
                         if (c->tx_preamble_pos == 4) {
                             c->tx_in_progress = true;
                         }
-                    } else if (c->tx_fifo_used < el3_tx_fifo_cap(c)) {
+                    } else if (c->tx_fifo_used < TX_FIFO_SIZE) {
                         c->tx_fifo[c->tx_fifo_write_ptr] = b;
-                        c->tx_fifo_write_ptr = (c->tx_fifo_write_ptr + 1) % el3_tx_fifo_cap(c);
+                        c->tx_fifo_write_ptr = (c->tx_fifo_write_ptr + 1) % TX_FIFO_SIZE;
                         c->tx_fifo_used++;
                         c->current_tx_written++;
                     }

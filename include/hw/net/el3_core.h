@@ -120,12 +120,12 @@ typedef enum {
 #define TX_STATUS_JABBER     0x10  /* Jabber timeout */
 #define TX_STATUS_UNDERRUN2  0x20  /* Transmit underrun */
 
-/* 3C59x RX Descriptor (UpList) Status bits 
- * Note: 3C905B/C does NOT support:
- * - Hardware checksum validation
- * - VLAN tag extraction
- * - Jumbo frames (max 1518 bytes)
- * These features appear in later Typhoon (3CR990) family
+/* 3C59x RX Descriptor (UpList) Status bits
+ * Note: the Vortex/Boomerang/Cyclone/Tornado silicon DOES support FDDI-sized large packets
+ * (<= 4494 bytes incl FCS) via allowLargePackets in MacControl -- it is gated off in software
+ * (like Linux 3c59x, limited by its 4K skbuff allocation; see Becker's 3c59x.c header and 3Com's
+ * PCI/EISA Bus-Master Driver Tech Ref p2-2). What the 3C905B/C lack vs the later 3CR990 Typhoon is
+ * hardware checksum validation, VLAN tag extraction, and true 9KB jumbo frames.
  */
 #define RXD_LENGTH_MASK      0x00001FFF  /* Bits 0-12: Packet length */
 #define RXD_ERROR            0x00004000  /* Bit 14: Error occurred */
@@ -637,8 +637,8 @@ struct EL3Core {
     uint8_t rx_packet_tail;      /* Index of next free slot */
     uint8_t rx_packet_count;     /* Number of packets in queue */
     
-    /* TX FIFO assembly buffer; sized for an FDDI-sized frame (allowLargePackets) */
-    uint8_t tx_fifo[4608];
+    /* TX FIFO for 3C509B (4KB) */
+    uint8_t tx_fifo[4096];
     uint16_t tx_fifo_write_ptr;  /* Write position in FIFO */
     uint16_t tx_fifo_read_ptr;   /* Read position in FIFO */
     uint16_t tx_fifo_used;        /* Bytes currently in FIFO */
@@ -774,6 +774,7 @@ uint32_t el3_core_read(EL3Core *c, hwaddr addr, unsigned size);
 void el3_core_write(EL3Core *c, hwaddr addr, uint32_t val, unsigned size);
 
 /* Networking functions */
+bool el3_core_can_receive(NetClientState *nc);
 ssize_t el3_core_receive(NetClientState *nc, const uint8_t *buf, size_t size);
 void el3_core_set_link_status(NetClientState *nc);
 void el3_core_tx_submit(EL3Core *c, const uint8_t *buf, size_t len);

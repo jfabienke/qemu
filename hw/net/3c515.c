@@ -181,6 +181,7 @@ static const EL3VariantOps isa_3c515_ops = {
 static NetClientInfo net_3c515_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
+    .can_receive = el3_core_can_receive,
     .receive = el3_core_receive,
     .link_status_changed = el3_core_set_link_status,
 };
