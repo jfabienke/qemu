@@ -45,8 +45,11 @@
  * is TCG-specific, and does not need to be built for other accels.
  */
 static bool icount_sleep = true;
-/* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
-#define MAX_ICOUNT_SHIFT 10
+/* Upstream arbitrarily caps the minimum modelled speed at ~1 MIPS (shift 10). Raised to 12 (~0.24
+ * MIPS) so the el3 throughput matrix can model sub-286 CPUs: shift 11 ~= 0.49 MIPS (8088/4.77 MHz
+ * class). Slower shifts only make fixed-time I/O waits OVER-run (safe), unlike shift<9 which under-runs
+ * the EEPROM busy window -- see include/hw/net/el3_core.h. */
+#define MAX_ICOUNT_SHIFT 12
 
 bool icount_align_option;
 
