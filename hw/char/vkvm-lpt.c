@@ -23,6 +23,7 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 
 #define TYPE_VKVM_LPT "vkvm-lpt"
 OBJECT_DECLARE_SIMPLE_TYPE(VkvmLptState, VKVM_LPT)
@@ -110,6 +111,13 @@ enum {
     VKVM_FAULT_DMA_SHORT = 5,
 };
 
+enum {
+    VKVM_TIMING_OFF = 0,
+    VKVM_TIMING_CONSERVATIVE = 1,
+    VKVM_TIMING_LATE_1284 = 2,
+    VKVM_TIMING_CUSTOM = 3,
+};
+
 struct VkvmLptState {
     ISADevice parent_obj;
 
@@ -121,6 +129,17 @@ struct VkvmLptState {
     uint8_t max_mode;
     uint8_t fault;
     bool trace;
+    char *timing;
+    uint8_t timing_mode;
+    uint64_t spp_ns;
+    uint64_t byte_ns;
+    uint64_t epp_ns;
+    uint64_t ecp_ns;
+    uint64_t dma_setup_ns;
+    uint64_t dma_ns;
+    uint64_t inbound_ready_ns;
+    uint64_t reverse_ready_tail_ns;
+    QEMUTimer *ready_timer;
 
     uint8_t data;
     uint8_t control;
@@ -136,6 +155,7 @@ struct VkvmLptState {
     uint16_t stage0_block_no;
 
     uint8_t reverse[REVERSE_CAP];
+    uint64_t reverse_ready[REVERSE_CAP];
     size_t reverse_head;
     size_t reverse_len;
 
@@ -147,6 +167,7 @@ struct VkvmLptState {
     uint8_t byte_data;
 
     uint8_t ecp_rx_fifo[ECP_FIFO_DEPTH];
+    uint64_t ecp_rx_ready[ECP_FIFO_DEPTH];
     size_t ecp_rx_head;
     size_t ecp_rx_len;
     IsaDma *isa_dma;
@@ -216,6 +237,84 @@ static uint32_t vkvm_crc32(const uint8_t *buf, size_t len)
     return crc ^ 0xffffffffu;
 }
 
+static uint64_t vkvm_now_ns(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static bool vkvm_timing_enabled(VkvmLptState *s)
+{
+    return s->timing_mode != VKVM_TIMING_OFF;
+}
+
+static uint64_t vkvm_mode_byte_ns(VkvmLptState *s)
+{
+    if (!vkvm_timing_enabled(s)) {
+        return 0;
+    }
+
+    if ((s->ecr & ECR_MODE_MASK) == ECR_MODE_ECP) {
+        if (s->ecr & ECR_DMA_EN) {
+            return s->dma_ns;
+        }
+        return s->ecp_ns;
+    }
+    if ((s->ecr & ECR_MODE_MASK) == ECR_MODE_EPP ||
+        s->active_mode == VKVM_MODE_EPP) {
+        return s->epp_ns;
+    }
+
+    switch (s->active_mode) {
+    case VKVM_MODE_BYTE:
+        return s->byte_ns;
+    case VKVM_MODE_EPP:
+        return s->epp_ns;
+    case VKVM_MODE_ECP:
+        return s->ecp_ns;
+    case VKVM_MODE_SPP:
+    default:
+        return s->spp_ns;
+    }
+}
+
+static void vkvm_note_inbound_byte(VkvmLptState *s)
+{
+    uint64_t byte_ns = vkvm_mode_byte_ns(s);
+
+    if (!byte_ns) {
+        return;
+    }
+
+    s->inbound_ready_ns = MAX(s->inbound_ready_ns, vkvm_now_ns()) + byte_ns;
+}
+
+static uint64_t vkvm_next_reverse_ready_ns(VkvmLptState *s)
+{
+    uint64_t byte_ns = vkvm_mode_byte_ns(s);
+    uint64_t ready = MAX(vkvm_now_ns(), s->inbound_ready_ns);
+
+    ready = MAX(ready, s->reverse_ready_tail_ns);
+    if (byte_ns) {
+        ready += byte_ns;
+    }
+    s->reverse_ready_tail_ns = ready;
+    return ready;
+}
+
+static void vkvm_schedule_reverse_ready(VkvmLptState *s)
+{
+    uint64_t ready_ns;
+
+    if (!vkvm_timing_enabled(s) || !s->ready_timer || s->reverse_len == 0) {
+        return;
+    }
+
+    ready_ns = s->reverse_ready[s->reverse_head];
+    if (ready_ns > vkvm_now_ns()) {
+        timer_mod(s->ready_timer, ready_ns);
+    }
+}
+
 static bool vkvm_push_reverse(VkvmLptState *s, uint8_t byte)
 {
     size_t idx;
@@ -228,7 +327,11 @@ static bool vkvm_push_reverse(VkvmLptState *s, uint8_t byte)
 
     idx = (s->reverse_head + s->reverse_len) % REVERSE_CAP;
     s->reverse[idx] = byte;
+    s->reverse_ready[idx] = vkvm_next_reverse_ready_ns(s);
     s->reverse_len++;
+    if (was_empty) {
+        vkvm_schedule_reverse_ready(s);
+    }
     if (was_empty && s->reverse_half == 0 && s->status_reads == 0) {
         s->nibble_phase ^= STAT_PHASE;
     }
@@ -246,6 +349,7 @@ static bool vkvm_ecp_dma_enabled(VkvmLptState *s)
 
 static void vkvm_accept_byte(VkvmLptState *s, uint8_t byte);
 static void vkvm_ecp_dma_update(VkvmLptState *s);
+static void vkvm_ready_timer_cb(void *opaque);
 
 static void vkvm_push_le16(VkvmLptState *s, uint16_t value)
 {
@@ -265,10 +369,72 @@ static bool vkvm_pop_reverse(VkvmLptState *s, uint8_t *byte)
     return true;
 }
 
+static bool vkvm_pop_reverse_ready(VkvmLptState *s, uint8_t *byte,
+                                   uint64_t *ready_ns)
+{
+    if (s->reverse_len == 0 ||
+        (vkvm_timing_enabled(s) && s->reverse_ready[s->reverse_head] > vkvm_now_ns())) {
+        vkvm_schedule_reverse_ready(s);
+        return false;
+    }
+
+    if (ready_ns) {
+        *ready_ns = s->reverse_ready[s->reverse_head];
+    }
+    return vkvm_pop_reverse(s, byte);
+}
+
+static bool vkvm_push_reverse_front_ready(VkvmLptState *s, uint8_t byte,
+                                          uint64_t ready_ns)
+{
+    if (s->reverse_len >= REVERSE_CAP) {
+        s->errors++;
+        return false;
+    }
+
+    s->reverse_head = (s->reverse_head + REVERSE_CAP - 1) % REVERSE_CAP;
+    s->reverse[s->reverse_head] = byte;
+    s->reverse_ready[s->reverse_head] = ready_ns;
+    s->reverse_len++;
+    vkvm_schedule_reverse_ready(s);
+    return true;
+}
+
 static void vkvm_ecp_rx_clear(VkvmLptState *s)
 {
     s->ecp_rx_head = 0;
     s->ecp_rx_len = 0;
+}
+
+static void vkvm_ecp_rx_unfill(VkvmLptState *s)
+{
+    while (s->ecp_rx_len > 0) {
+        size_t idx = (s->ecp_rx_head + s->ecp_rx_len - 1) % ECP_FIFO_DEPTH;
+
+        if (!vkvm_push_reverse_front_ready(s, s->ecp_rx_fifo[idx],
+                                           s->ecp_rx_ready[idx])) {
+            break;
+        }
+        s->ecp_rx_len--;
+    }
+    s->ecp_rx_head = 0;
+}
+
+static void vkvm_reset_session(VkvmLptState *s)
+{
+    s->inbound_len = 0;
+    s->stage0_probe_pos = 0;
+    s->stage0_raw_state = STAGE0_RAW_IDLE;
+    s->reverse_head = 0;
+    s->reverse_len = 0;
+    s->nibble_phase = 0;
+    s->reverse_half = 0;
+    s->status_reads = 0;
+    s->byte_ack = false;
+    s->inbound_ready_ns = 0;
+    s->reverse_ready_tail_ns = 0;
+    vkvm_ecp_rx_clear(s);
+    vkvm_ecp_dma_update(s);
 }
 
 static void vkvm_ecp_rx_fill(VkvmLptState *s)
@@ -276,7 +442,9 @@ static void vkvm_ecp_rx_fill(VkvmLptState *s)
     while (s->ecp_rx_len < ECP_FIFO_DEPTH && s->reverse_len > 0) {
         size_t idx = (s->ecp_rx_head + s->ecp_rx_len) % ECP_FIFO_DEPTH;
 
-        if (!vkvm_pop_reverse(s, &s->ecp_rx_fifo[idx])) {
+        if (!vkvm_pop_reverse_ready(s, &s->ecp_rx_fifo[idx],
+                                    &s->ecp_rx_ready[idx])) {
+            vkvm_schedule_reverse_ready(s);
             break;
         }
         s->ecp_rx_len++;
@@ -302,7 +470,9 @@ static bool vkvm_peek_reverse_nibble(VkvmLptState *s, uint8_t *nibble)
 {
     uint8_t byte;
 
-    if (s->reverse_len == 0) {
+    if (s->reverse_len == 0 ||
+        (vkvm_timing_enabled(s) && s->reverse_ready[s->reverse_head] > vkvm_now_ns())) {
+        vkvm_schedule_reverse_ready(s);
         return false;
     }
 
@@ -578,11 +748,23 @@ static void vkvm_ecp_dma_update(VkvmLptState *s)
 
     if (s->control & CTRL_DIR_INPUT) {
         vkvm_ecp_rx_fill(s);
-        vkvm_ecp_dma_set_dreq(s, s->fault != VKVM_FAULT_ECP_EMPTY_STUCK &&
-                              s->ecp_rx_len > 0);
+        if (s->ecp_rx_len > 0) {
+            vkvm_ecp_dma_set_dreq(s, s->fault != VKVM_FAULT_ECP_EMPTY_STUCK);
+        } else {
+            vkvm_schedule_reverse_ready(s);
+            vkvm_ecp_dma_set_dreq(s, false);
+        }
     } else {
         vkvm_ecp_dma_set_dreq(s, true);
     }
+}
+
+static void vkvm_ready_timer_cb(void *opaque)
+{
+    VkvmLptState *s = opaque;
+
+    vkvm_ecp_dma_update(s);
+    vkvm_schedule_reverse_ready(s);
 }
 
 static int vkvm_ecp_dma_transfer(void *opaque, int nchan, int dma_pos,
@@ -718,6 +900,8 @@ static void vkvm_process_packets(VkvmLptState *s)
 
 static void vkvm_accept_byte(VkvmLptState *s, uint8_t byte)
 {
+    vkvm_note_inbound_byte(s);
+
     if (s->inbound_len == 0 && byte != SOH) {
         vkvm_accept_stage0_byte(s, byte);
         return;
@@ -793,23 +977,32 @@ static uint8_t vkvm_status_read(VkvmLptState *s)
 
 static void vkvm_control_write(VkvmLptState *s, uint8_t value)
 {
+    uint8_t old_control = s->control;
     bool prev_init_high = (s->control & CTRL_INIT) != 0;
     bool next_init_low = (value & CTRL_INIT) == 0;
 
+    if (value == CTRL_NEG_REQ && old_control != CTRL_NEG_REQ) {
+        vkvm_reset_session(s);
+    }
+
     s->control = value;
     if ((value & CTRL_DIR_INPUT) == 0) {
-        vkvm_ecp_rx_clear(s);
+        vkvm_ecp_rx_unfill(s);
     }
     vkvm_ecp_dma_update(s);
 
-    if (value == CTRL_NEG_ACK) {
+    if (value == CTRL_NEG_ACK &&
+        (old_control == CTRL_NEG_REQ || old_control == CTRL_NEG_STRB)) {
         s->active_mode = vkvm_mode_from_xflag(s->pending_xflag);
         vkvm_trace(s, "negotiated mode=%u", s->active_mode);
         return;
     }
 
     if ((value & CTRL_DIR_INPUT) && (value & 0x02) && s->reverse_len > 0) {
-        vkvm_pop_reverse(s, &s->byte_data);
+        if (!vkvm_pop_reverse_ready(s, &s->byte_data, NULL)) {
+            vkvm_ecp_dma_update(s);
+            return;
+        }
         s->byte_ack = true;
         return;
     }
@@ -840,7 +1033,7 @@ static uint64_t vkvm_base_read(void *opaque, hwaddr addr, unsigned size)
         byte = s->control;
         break;
     case LPT_EPP_DATA:
-        if (!vkvm_pop_reverse(s, &byte)) {
+        if (!vkvm_pop_reverse_ready(s, &byte, NULL)) {
             byte = 0xff;
             s->errors++;
         }
@@ -933,7 +1126,12 @@ static void vkvm_ecp_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case LPT_ECR:
         if ((s->ecr & ECR_MODE_MASK) != (byte & ECR_MODE_MASK)) {
-            vkvm_ecp_rx_clear(s);
+            vkvm_ecp_rx_unfill(s);
+        }
+        if (vkvm_timing_enabled(s) &&
+            (byte & ECR_DMA_EN) && !(s->ecr & ECR_DMA_EN)) {
+            s->inbound_ready_ns = MAX(s->inbound_ready_ns, vkvm_now_ns()) +
+                                  s->dma_setup_ns;
         }
         s->ecr = byte;
         vkvm_ecp_dma_update(s);
@@ -963,8 +1161,90 @@ static const MemoryRegionOps vkvm_ecp_ops = {
     },
 };
 
+static void vkvm_lpt_apply_timing(VkvmLptState *s, Error **errp)
+{
+    const char *timing = s->timing ? s->timing : "off";
+
+    if (g_strcmp0(timing, "off") == 0) {
+        s->timing_mode = VKVM_TIMING_OFF;
+        return;
+    }
+
+    if (g_strcmp0(timing, "conservative") == 0) {
+        s->timing_mode = VKVM_TIMING_CONSERVATIVE;
+        if (!s->spp_ns) {
+            s->spp_ns = 20000;
+        }
+        if (!s->byte_ns) {
+            s->byte_ns = 5000;
+        }
+        if (!s->epp_ns) {
+            s->epp_ns = 1000;
+        }
+        if (!s->ecp_ns) {
+            s->ecp_ns = 1000;
+        }
+        if (!s->dma_setup_ns) {
+            s->dma_setup_ns = 8000;
+        }
+        if (!s->dma_ns) {
+            s->dma_ns = 500;
+        }
+        return;
+    }
+
+    if (g_strcmp0(timing, "late-1284") == 0) {
+        s->timing_mode = VKVM_TIMING_LATE_1284;
+        if (!s->spp_ns) {
+            s->spp_ns = 10000;
+        }
+        if (!s->byte_ns) {
+            s->byte_ns = 2000;
+        }
+        if (!s->epp_ns) {
+            s->epp_ns = 500;
+        }
+        if (!s->ecp_ns) {
+            s->ecp_ns = 500;
+        }
+        if (!s->dma_setup_ns) {
+            s->dma_setup_ns = 4000;
+        }
+        if (!s->dma_ns) {
+            s->dma_ns = 250;
+        }
+        return;
+    }
+
+    if (g_strcmp0(timing, "custom") == 0) {
+        s->timing_mode = VKVM_TIMING_CUSTOM;
+        if (!s->spp_ns) {
+            s->spp_ns = 10000;
+        }
+        if (!s->byte_ns) {
+            s->byte_ns = 2000;
+        }
+        if (!s->epp_ns) {
+            s->epp_ns = 500;
+        }
+        if (!s->ecp_ns) {
+            s->ecp_ns = 500;
+        }
+        if (!s->dma_setup_ns) {
+            s->dma_setup_ns = 4000;
+        }
+        if (!s->dma_ns) {
+            s->dma_ns = 250;
+        }
+        return;
+    }
+
+    error_setg(errp, "timing must be off, conservative, late-1284, or custom");
+}
+
 static void vkvm_lpt_realizefn(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();   /* apply_timing's *errp is checked below; make errp always safe to deref */
     ISADevice *isa = ISA_DEVICE(dev);
     VkvmLptState *s = VKVM_LPT(dev);
     ISABus *bus = isa_bus_from_device(isa);
@@ -982,6 +1262,11 @@ static void vkvm_lpt_realizefn(DeviceState *dev, Error **errp)
         error_setg(errp, "fault must be 0(none)..5(dma-short)");
         return;
     }
+    vkvm_lpt_apply_timing(s, errp);
+    if (*errp) {
+        return;
+    }
+    s->ready_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vkvm_ready_timer_cb, s);
 
     if (s->dma >= 0) {
         s->isa_dma = isa_bus_get_dma(bus, s->dma);
@@ -1005,7 +1290,24 @@ static void vkvm_lpt_realizefn(DeviceState *dev, Error **errp)
                           "vkvm-lpt-ecp", 3);
     isa_register_ioport(isa, &s->ecp_io, s->iobase + 0x400);
 
-    vkvm_trace(s, "realized iobase=0x%x max_mode=%u", s->iobase, s->max_mode);
+    vkvm_trace(s,
+               "realized iobase=0x%x max_mode=%u timing=%s spp=%" PRIu64
+               " byte=%" PRIu64 " epp=%" PRIu64 " ecp=%" PRIu64
+               " dma_setup=%" PRIu64 " dma=%" PRIu64,
+               s->iobase, s->max_mode, s->timing ? s->timing : "off",
+               s->spp_ns, s->byte_ns, s->epp_ns, s->ecp_ns,
+               s->dma_setup_ns, s->dma_ns);
+}
+
+static void vkvm_lpt_unrealizefn(DeviceState *dev)
+{
+    VkvmLptState *s = VKVM_LPT(dev);
+
+    if (s->ready_timer) {
+        timer_del(s->ready_timer);
+        timer_free(s->ready_timer);
+        s->ready_timer = NULL;
+    }
 }
 
 static const Property vkvm_lpt_properties[] = {
@@ -1014,6 +1316,13 @@ static const Property vkvm_lpt_properties[] = {
     DEFINE_PROP_UINT8("max-mode", VkvmLptState, max_mode, VKVM_MODE_ECP),
     DEFINE_PROP_UINT8("fault", VkvmLptState, fault, VKVM_FAULT_NONE),
     DEFINE_PROP_BOOL("trace", VkvmLptState, trace, false),
+    DEFINE_PROP_STRING("timing", VkvmLptState, timing),
+    DEFINE_PROP_UINT64("spp-ns", VkvmLptState, spp_ns, 0),
+    DEFINE_PROP_UINT64("byte-ns", VkvmLptState, byte_ns, 0),
+    DEFINE_PROP_UINT64("epp-ns", VkvmLptState, epp_ns, 0),
+    DEFINE_PROP_UINT64("ecp-ns", VkvmLptState, ecp_ns, 0),
+    DEFINE_PROP_UINT64("dma-setup-ns", VkvmLptState, dma_setup_ns, 0),
+    DEFINE_PROP_UINT64("dma-ns", VkvmLptState, dma_ns, 0),
 };
 
 static void vkvm_lpt_class_init(ObjectClass *klass, const void *data)
@@ -1021,6 +1330,7 @@ static void vkvm_lpt_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = vkvm_lpt_realizefn;
+    dc->unrealize = vkvm_lpt_unrealizefn;
     device_class_set_props(dc, vkvm_lpt_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
