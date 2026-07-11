@@ -1,7 +1,28 @@
 /*
- * QEMU 3Com 3C59x Vortex/Boomerang emulation
+ * QEMU 3Com EtherLink III PCI family emulation
  *
- * Copyright (c) 2024 QEMU contributors
+ *   -device 3c590   3C590 Vortex     (PCI, windowed PIO datapath only)
+ *   -device 3c905   3C905 Boomerang  (PCI, + DnListPtr/UpListPtr descriptor DMA)
+ *
+ * Two thin PCI badges over the shared EL3 core (el3_core.c), mirroring the ISA
+ * 3c509/3c515 wrapper pattern. Hardware-true register/descriptor semantics are
+ * taken from the authoritative open drivers:
+ *   - Linux drivers/net/ethernet/3com/3c59x.c (Becker):
+ *       DPD: { DnNextPtr, FrameStartHeader, frag pairs }, FSH DN_COMPLETE
+ *       0x00010000 written back by the NIC, TxIntrUploaded 0x80000000 requests
+ *       the DnComplete indication, LAST_FRAG 0x80000000 on the fragment length;
+ *       UPD status RxDComplete 0x00008000; ring engines start on a list-pointer
+ *       write while idle (DnListPtr reads 0 when the engine has consumed the
+ *       list); StallCtl is command 6 (params 0..3 = UpStall/UpUnstall/DownStall/
+ *       DownUnstall).
+ *   - iPXE src/drivers/net/3c90x.{c,h}: fshDnComplete 0x10000, upComplete
+ *       1<<15, up/downLastFrag 1<<31, DnStall -> patch DnNextPtr -> write
+ *       DnListPtr if 0 -> DnUnstall append discipline.
+ *
+ * There is deliberately NO bit-31 "ownership" flag in descriptor status: real
+ * silicon has none. TX ownership is implicit in list membership (the driver
+ * links a DPD in only under DownStall); RX UPD "free" is UpPktStatus == 0
+ * (the driver clears the status dword when it has consumed the packet).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -16,251 +37,345 @@
 #include "qemu/error-report.h"
 #include "net/net.h"
 #include "net/eth.h"
-/* DMA functions are included via pci headers */
 
-#define TYPE_PCI_3C59X "3c59x"
-OBJECT_DECLARE_SIMPLE_TYPE(PCI3C59XState, PCI_3C59X)
+#define TYPE_EL3_PCI "el3-pci"
+OBJECT_DECLARE_TYPE(EL3PCIState, EL3PCIClass, EL3_PCI)
 
-#define PCI_3C59X_IO_SIZE    0x80
-#define PCI_3C59X_MMIO_SIZE  0x80
+#define PCI_EL3_IO_SIZE      0x80    /* I/O BAR0 extent (3C590/3C905; no memory BAR) */
 
-struct PCI3C59XState {
+/* Boomerang DMA register block inside BAR0 (90x layout; the ISA 3C515 aliases
+ * the same block at iobase+0x400). */
+#define PCI_EL3_DMA_BASE     0x20
+#define PCI_EL3_DMA_END      0x40
+#define PCI_EL3_PKT_STATUS   0x20    /* DnPktStatus (RO, diagnostic) */
+#define PCI_EL3_DN_LIST_PTR  0x24    /* DnListPtr (32-bit; 16-bit drivers write 0x24/0x26) */
+#define PCI_EL3_UP_PKT_STAT  0x30    /* UpPktStatus (RO, diagnostic) */
+#define PCI_EL3_UP_LIST_PTR  0x38    /* UpListPtr  (32-bit; halves at 0x38/0x3A) */
+
+/* FrameStartHeader (DPD status dword) -- Linux 3c59x.c / iPXE 3c90x.h */
+#define FSH_DN_COMPLETE      0x00010000  /* NIC write-back: packet downloaded */
+#define FSH_TX_INDICATE      0x00008000  /* request TxComplete + TxStatus after transmission
+                                          * (iPXE fshTxIndicate; polled drivers rely on it) */
+#define FSH_DN_INDICATE      0x80000000  /* request DnComplete indication (TxIntrUploaded) */
+#define FSH_PKT_LEN_MASK     0x00001FFF
+
+/* Fragment length dword */
+#define FRAG_LAST            0x80000000  /* last addr/len pair of this descriptor */
+#define FRAG_LEN_MASK        0x00001FFF
+
+/* UpPktStatus (UPD status dword) */
+#define UPS_UP_COMPLETE      0x00008000  /* NIC write-back: packet uploaded */
+#define UPS_UP_ERROR         0x00004000
+#define UPS_UP_OVERRUN       0x00010000  /* buffer too small for the frame */
+#define UPS_PKT_LEN_MASK     0x00001FFF
+
+/* Walker safety caps (defensive: a corrupt guest list must not wedge QEMU). */
+#define PCI_EL3_MAX_DPDS     64      /* descriptors per kick */
+#define PCI_EL3_MAX_FRAGS    16      /* fragment pairs per DPD */
+#define PCI_EL3_MAX_FRAME    4608    /* matches the core's FDDI-scale TX slot */
+
+struct EL3PCIState {
     PCIDevice parent_obj;
     EL3Core core;
     EL3DMAEngine dma_engine;
     MemoryRegion io;
-    MemoryRegion mmio;
 };
 
-/* PCI DMA descriptor structure (16 bytes) */
-typedef struct {
-    uint32_t next;      /* Next descriptor physical address */
-    uint32_t status;    /* Status and control bits */
-    uint32_t addr;      /* Data buffer physical address */
-    uint32_t length;    /* Fragment length and flags */
-} EL3PciDesc;
+struct EL3PCIClass {
+    PCIDeviceClass parent_class;
+    uint16_t device_id;
+    EL3Model model;
+    bool has_dma;
+};
 
-/* Read PCI DMA descriptor */
-static bool el3_pci_dma_read_desc(PCI3C59XState *s, hwaddr addr, EL3PciDesc *desc)
+/* ---- descriptor accessors -------------------------------------------------- */
+
+static bool el3_pci_dma_read32(EL3PCIState *s, hwaddr addr, uint32_t *val)
 {
-    PCIDevice *pci = PCI_DEVICE(s);
-    
-    /* Read 16-byte descriptor */
-    if (pci_dma_read(pci, addr, desc, sizeof(*desc)) != 0) {
+    uint32_t le;
+    if (pci_dma_read(PCI_DEVICE(s), addr, &le, 4) != 0) {
         return false;
     }
-    
-    /* Convert from little-endian */
-    desc->next = le32_to_cpu(desc->next);
-    desc->status = le32_to_cpu(desc->status);
-    desc->addr = le32_to_cpu(desc->addr);
-    desc->length = le32_to_cpu(desc->length);
-    
+    *val = le32_to_cpu(le);
     return true;
 }
 
-/* Write back descriptor status */
-static void el3_pci_dma_write_status(PCI3C59XState *s, hwaddr addr, uint32_t status)
+/* Write back a descriptor's status dword (offset +4: FSH / UpPktStatus).
+ * Status-dword-only, never the driver-owned next/addr/len fields. */
+static void el3_pci_dma_write_status(EL3PCIState *s, hwaddr desc, uint32_t status)
 {
-    PCIDevice *pci = PCI_DEVICE(s);
-    uint32_t le_status = cpu_to_le32(status);
-    pci_dma_write(pci, addr + 4, &le_status, 4);
+    uint32_t le = cpu_to_le32(status);
+    pci_dma_write(PCI_DEVICE(s), desc + 4, &le, 4);
 }
 
-/* Process TX descriptor chain */
-static void el3_pci_process_tx_chain(PCI3C59XState *s)
+/* ---- TX: download-list walker (Boomerang) ---------------------------------- */
+
+/* Walk the DPD list from DnListPtr: per descriptor gather the fragment pairs
+ * (addr/len at +8, +16, ... until FRAG_LAST), transmit the frame, write
+ * FSH_DN_COMPLETE back into the FSH, honor FSH_DN_INDICATE, follow DnNextPtr.
+ * The engine goes idle (DnListPtr = 0) at a null next pointer -- drivers rely
+ * on reading 0 to know they may write a fresh list head. */
+static void el3_pci_process_tx_chain(EL3PCIState *s)
 {
-    EL3PciDesc desc;
-    uint8_t buf[1536];  /* ETH_MAX_FRAME_LEN */
-    uint32_t total_len = 0;
-    hwaddr current = s->core.down_list_ptr;
+    EL3Core *c = &s->core;
+    uint8_t buf[PCI_EL3_MAX_FRAME];
+    hwaddr current = c->down_list_ptr;
     int processed = 0;
-    const int max_descriptors = 64;
-    
-    while (current && processed < max_descriptors) {
-        /* Read descriptor */
-        if (!el3_pci_dma_read_desc(s, current, &desc)) {
-            s->core.status |= STAT_ADAPTER_FAIL;
-            s->core.int_status |= STAT_ADAPTER_FAIL;
-            el3_update_irq(&s->core);
+
+    while (current && !c->down_stalled && processed < PCI_EL3_MAX_DPDS) {
+        uint32_t next, fsh;
+        uint32_t total_len = 0;
+        hwaddr frag = current + 8;
+        int nfrags = 0;
+        bool last = false;
+
+        if (!el3_pci_dma_read32(s, current, &next) ||
+            !el3_pci_dma_read32(s, current + 4, &fsh)) {
+            c->status |= STAT_ADAPTER_FAIL;
+            c->int_status |= STAT_ADAPTER_FAIL;
+            el3_update_irq(c);
             break;
         }
-        
-        /* Check ownership (bit 31) */
-        if (!(desc.status & 0x80000000)) {
-            /* Driver owns it, stall */
-            s->core.down_stalled = true;
+
+        /* A DPD the NIC already completed means the driver hasn't refreshed
+         * this entry -- a live engine is never pointed at one. Stop rather
+         * than re-transmit stale data. */
+        if (fsh & FSH_DN_COMPLETE) {
             break;
         }
-        
-        /* Extract packet length */
-        uint32_t len = desc.length & 0x1FFF;
-        
-        /* Check for last fragment (bit 31 of length) */
-        bool last_frag = (desc.length & 0x80000000) != 0;
-        
-        /* Read fragment data */
-        if (total_len + len > sizeof(buf)) {
-            len = sizeof(buf) - total_len;
+
+        /* Gather the fragment list embedded in this DPD. */
+        while (!last && nfrags < PCI_EL3_MAX_FRAGS) {
+            uint32_t faddr, flen, len;
+
+            if (!el3_pci_dma_read32(s, frag, &faddr) ||
+                !el3_pci_dma_read32(s, frag + 4, &flen)) {
+                c->status |= STAT_ADAPTER_FAIL;
+                c->int_status |= STAT_ADAPTER_FAIL;
+                el3_update_irq(c);
+                return;
+            }
+            last = (flen & FRAG_LAST) != 0;
+            len = flen & FRAG_LEN_MASK;
+            if (len > sizeof(buf) - total_len) {
+                len = sizeof(buf) - total_len;   /* clamp corrupt lists */
+            }
+            if (len &&
+                pci_dma_read(PCI_DEVICE(s), faddr, buf + total_len, len) != 0) {
+                c->status |= STAT_ADAPTER_FAIL;
+                c->int_status |= STAT_ADAPTER_FAIL;
+                el3_update_irq(c);
+                return;
+            }
+            total_len += len;
+            frag += 8;
+            nfrags++;
         }
-        
-        if (pci_dma_read(PCI_DEVICE(s), desc.addr, buf + total_len, len) != 0) {
-            s->core.status |= STAT_ADAPTER_FAIL;
-            break;
+
+        if (total_len) {
+            qemu_send_packet(qemu_get_queue(c->nic), buf, total_len);
+            c->stats.tx_frames_ok++;
+            c->stats.tx_bytes_ok += total_len;
         }
-        
-        total_len += len;
-        
-        /* If last fragment, send packet */
-        if (last_frag) {
-            qemu_send_packet(qemu_get_queue(s->core.nic), buf, total_len);
-            s->core.stats.tx_frames_ok++;
-            s->core.stats.tx_bytes_ok += total_len;
-            total_len = 0;
+
+        /* Hardware write-back: FSH |= dnComplete (never touches next/frags). */
+        el3_pci_dma_write_status(s, current, fsh | FSH_DN_COMPLETE);
+
+        if (fsh & FSH_DN_INDICATE) {
+            c->status |= STAT_DOWN_COMPLETE;
+            c->int_status |= STAT_DOWN_COMPLETE;
+            el3_update_irq(c);
         }
-        
-        /* Update descriptor status */
-        desc.status &= ~0x80000000;  /* Clear ownership */
-        desc.status |= 0x00004000;   /* Set download complete */
-        el3_pci_dma_write_status(s, current, desc.status);
-        
-        /* Generate interrupt if requested (bit 15) */
-        if (desc.status & 0x00008000) {
-            s->core.status |= STAT_DOWN_COMPLETE;
-            s->core.int_status |= STAT_DOWN_COMPLETE;
-            el3_update_irq(&s->core);
+        if (fsh & FSH_TX_INDICATE) {
+            /* Classic EL3 TxComplete indication + TxStatus entry, requested
+             * per-packet via the FSH (iPXE gates its whole poll on this). */
+            c->tx_status = TX_STAT_COMPLETE;
+            c->status |= STAT_TX_COMPLETE;
+            c->int_status |= STAT_TX_COMPLETE;
+            el3_update_irq(c);
         }
-        
-        /* Move to next descriptor */
-        current = desc.next;
+
+        current = next;
         processed++;
     }
-    
-    s->core.down_list_ptr = current;
+
+    /* 0 at a natural end = engine idle; a stall preserves the resume point. */
+    c->down_list_ptr = current;
 }
 
-/* Process RX into descriptor chain */
+/* ---- RX: upload-list placer (Boomerang) ------------------------------------ */
+
+/* One UPD carries one packet. A UPD is free iff its UpPktStatus has been
+ * cleared by the driver (upComplete not set). If the head UPD is still
+ * complete, the up engine stalls: return 0 so the net layer queues the frame;
+ * UpUnstall flushes the queue. */
 static ssize_t el3_pci_rx_place_frame(EL3Core *c, const uint8_t *buf, size_t size,
                                       uint32_t rx_status, uint32_t rx_len)
 {
-    PCI3C59XState *s = container_of(c, PCI3C59XState, core);
-    EL3PciDesc desc;
+    EL3PCIState *s = container_of(c, EL3PCIState, core);
+    uint32_t next, status, addr, flen;
+    uint32_t frag_size, wr;
     hwaddr current = c->up_list_ptr;
-    size_t offset = 0;
-    
-    while (current && offset < size) {
-        /* Read descriptor */
-        if (!el3_pci_dma_read_desc(s, current, &desc)) {
-            return -1;
-        }
-        
-        /* Check ownership */
-        if (!(desc.status & 0x80000000)) {
-            /* Driver owns it, drop packet */
-            c->up_stalled = true;
-            return -1;
-        }
-        
-        /* Calculate fragment size */
-        uint32_t frag_size = desc.length & 0x1FFF;
-        if (frag_size > size - offset) {
-            frag_size = size - offset;
-        }
-        
-        /* Write data to buffer */
-        if (pci_dma_write(PCI_DEVICE(s), desc.addr, buf + offset, frag_size) != 0) {
-            return -1;
-        }
-        
-        offset += frag_size;
-        
-        /* Update descriptor */
-        desc.status &= ~0x80000000;  /* Clear ownership */
-        desc.status |= 0x00004000;   /* Set upload complete */
-        desc.status |= (size & 0x1FFF);  /* Store total packet length */
-        
-        /* Set error bits if needed */
-        if (rx_status & RX_STATUS_ERROR) {
-            desc.status |= 0x00002000;  /* Upload error */
-        }
-        
-        /* Mark last fragment */
-        if (offset >= size) {
-            desc.length |= 0x80000000;  /* Last fragment bit */
-        }
-        
-        el3_pci_dma_write_status(s, current, desc.status);
-        
-        /* Generate interrupt if requested */
-        if (desc.status & 0x00008000) {
-            c->status |= STAT_UP_COMPLETE;
-            c->int_status |= STAT_UP_COMPLETE;
-            el3_update_irq(c);
-        }
-        
-        /* Move to next */
-        current = desc.next;
-        
-        /* If packet complete, break */
-        if (offset >= size) {
-            break;
-        }
+
+    if (!current) {
+        return -1;                       /* no upload ring configured: drop */
     }
-    
-    c->up_list_ptr = current;
+
+    if (!el3_pci_dma_read32(s, current, &next) ||
+        !el3_pci_dma_read32(s, current + 4, &status) ||
+        !el3_pci_dma_read32(s, current + 8, &addr) ||
+        !el3_pci_dma_read32(s, current + 12, &flen)) {
+        return -1;
+    }
+
+    if (status & UPS_UP_COMPLETE) {
+        c->up_stalled = true;            /* driver hasn't freed the head UPD */
+        return 0;                        /* queue; UpUnstall flushes */
+    }
+
+    frag_size = flen & FRAG_LEN_MASK;
+    wr = size;
+    status = size & UPS_PKT_LEN_MASK;
+    if (wr > frag_size) {
+        wr = frag_size;                  /* frame larger than the UPD buffer */
+        status |= UPS_UP_ERROR | UPS_UP_OVERRUN;
+    }
+    if (rx_status & RX_STATUS_ERROR) {
+        status |= UPS_UP_ERROR;
+    }
+
+    if (wr && pci_dma_write(PCI_DEVICE(s), addr, buf, wr) != 0) {
+        return -1;
+    }
+
+    el3_pci_dma_write_status(s, current, status | UPS_UP_COMPLETE);
+    c->up_list_ptr = next;               /* driver rings are circular (Linux/iPXE) */
+
+    c->status |= STAT_UP_COMPLETE;
+    c->int_status |= STAT_UP_COMPLETE;
+    el3_update_irq(c);
     return size;
 }
 
-/* TX DMA bottom half handler */
+/* ---- kick plumbing ---------------------------------------------------------- */
+
 static void el3_pci_tx_bh(void *opaque)
 {
-    PCI3C59XState *s = opaque;
-    
+    EL3PCIState *s = opaque;
+
     if (!s->core.down_stalled && s->core.down_list_ptr) {
         el3_pci_process_tx_chain(s);
     }
 }
 
-/* RX DMA bottom half handler */
 static void el3_pci_rx_bh(void *opaque)
 {
-    PCI3C59XState *s = opaque;
-    
-    /* Process any pending RX packets */
+    EL3PCIState *s = opaque;
+
     if (!s->core.up_stalled && s->core.up_list_ptr) {
-        /* Flush any queued packets from the network backend */
         qemu_flush_queued_packets(qemu_get_queue(s->core.nic));
     }
 }
 
-/* TX kick handler */
 static void el3_pci_tx_kick(EL3Core *c)
 {
-    PCI3C59XState *s = container_of(c, PCI3C59XState, core);
-    
-    /* Schedule bottom half for async processing */
+    EL3PCIState *s = container_of(c, EL3PCIState, core);
+
     if (s->dma_engine.tx_bh) {
         qemu_bh_schedule(s->dma_engine.tx_bh);
     }
 }
 
-/* I/O port read handler */
-static uint64_t pci_3c59x_io_read(void *opaque, hwaddr addr, unsigned size)
+/* ---- BAR0 I/O --------------------------------------------------------------- */
+
+/* Boomerang DMA registers live at 0x20-0x3F inside BAR0; the windowed core
+ * register file handles everything else (including the Vortex Window-1 +0x10
+ * relocation, which the core models per EL3Model). The 3C590 badge has no DMA
+ * block: all offsets go to the core. */
+static uint64_t el3_pci_io_read(void *opaque, hwaddr addr, unsigned size)
 {
-    PCI3C59XState *s = opaque;
+    EL3PCIState *s = opaque;
+    EL3PCIClass *k = EL3_PCI_GET_CLASS(s);
+
+    if (k->has_dma && addr >= PCI_EL3_DMA_BASE && addr < PCI_EL3_DMA_END) {
+        switch (addr) {
+        case PCI_EL3_DN_LIST_PTR:
+            return (size == 4) ? s->core.down_list_ptr
+                               : (s->core.down_list_ptr & 0xFFFFu);
+        case PCI_EL3_DN_LIST_PTR + 2:
+            return (s->core.down_list_ptr >> 16) & 0xFFFFu;
+        case PCI_EL3_UP_LIST_PTR:
+            return (size == 4) ? s->core.up_list_ptr
+                               : (s->core.up_list_ptr & 0xFFFFu);
+        case PCI_EL3_UP_LIST_PTR + 2:
+            return (s->core.up_list_ptr >> 16) & 0xFFFFu;
+        case PCI_EL3_PKT_STATUS:
+        case PCI_EL3_UP_PKT_STAT:
+        default:
+            return 0;                    /* diagnostic regs: RAZ */
+        }
+    }
     return el3_core_read(&s->core, addr, size);
 }
 
-/* I/O port write handler */
-static void pci_3c59x_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+static void el3_pci_io_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
-    PCI3C59XState *s = opaque;
+    EL3PCIState *s = opaque;
+    EL3PCIClass *k = EL3_PCI_GET_CLASS(s);
+
+    if (k->has_dma && addr >= PCI_EL3_DMA_BASE && addr < PCI_EL3_DMA_END) {
+        switch (addr) {
+        case PCI_EL3_DN_LIST_PTR:
+            if (size == 4) {
+                s->core.down_list_ptr = (uint32_t)val;
+            } else {
+                s->core.down_list_ptr = (s->core.down_list_ptr & 0xFFFF0000u) |
+                                        (val & 0xFFFFu);
+            }
+            /* Writing a non-zero head while the engine is idle starts the
+             * fetch (drivers only write when DnListPtr reads 0). A 16-bit
+             * driver writes low half then high half: kick on either write;
+             * the BH re-reads the final pointer. */
+            if (s->core.down_list_ptr && !s->core.down_stalled) {
+                el3_pci_tx_kick(&s->core);
+            }
+            break;
+        case PCI_EL3_DN_LIST_PTR + 2:
+            s->core.down_list_ptr = (s->core.down_list_ptr & 0x0000FFFFu) |
+                                    ((val & 0xFFFFu) << 16);
+            if (s->core.down_list_ptr && !s->core.down_stalled) {
+                el3_pci_tx_kick(&s->core);
+            }
+            break;
+        case PCI_EL3_UP_LIST_PTR:
+            if (size == 4) {
+                s->core.up_list_ptr = (uint32_t)val;
+            } else {
+                s->core.up_list_ptr = (s->core.up_list_ptr & 0xFFFF0000u) |
+                                      (val & 0xFFFFu);
+            }
+            if (s->dma_engine.rx_bh) {
+                qemu_bh_schedule(s->dma_engine.rx_bh);
+            }
+            break;
+        case PCI_EL3_UP_LIST_PTR + 2:
+            s->core.up_list_ptr = (s->core.up_list_ptr & 0x0000FFFFu) |
+                                  ((val & 0xFFFFu) << 16);
+            if (s->dma_engine.rx_bh) {
+                qemu_bh_schedule(s->dma_engine.rx_bh);
+            }
+            break;
+        default:
+            break;                       /* other DMA-block regs: WI */
+        }
+        return;
+    }
     el3_core_write(&s->core, addr, val, size);
 }
 
-static const MemoryRegionOps pci_3c59x_io_ops = {
-    .read = pci_3c59x_io_read,
-    .write = pci_3c59x_io_write,
+static const MemoryRegionOps el3_pci_io_ops = {
+    .read = el3_pci_io_read,
+    .write = el3_pci_io_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
         .min_access_size = 1,
@@ -268,51 +383,27 @@ static const MemoryRegionOps pci_3c59x_io_ops = {
     },
 };
 
-/* MMIO read handler */
-static uint64_t pci_3c59x_mmio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    PCI3C59XState *s = opaque;
-    return el3_core_read(&s->core, addr, size);
-}
+/* ---- device plumbing --------------------------------------------------------- */
 
-/* MMIO write handler */
-static void pci_3c59x_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
-{
-    PCI3C59XState *s = opaque;
-    el3_core_write(&s->core, addr, val, size);
-}
-
-static const MemoryRegionOps pci_3c59x_mmio_ops = {
-    .read = pci_3c59x_mmio_read,
-    .write = pci_3c59x_mmio_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-    },
-};
-
-/* Network client info */
-static NetClientInfo net_3c59x_info = {
+static NetClientInfo net_el3_pci_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
     .receive = el3_core_receive,
     .link_status_changed = el3_core_set_link_status,
 };
 
-/* Reset handler */
-static void pci_3c59x_reset(DeviceState *dev)
+static void el3_pci_reset(DeviceState *dev)
 {
-    PCI3C59XState *s = PCI_3C59X(dev);
-    
-    /* Reset core */
+    EL3PCIState *s = EL3_PCI(dev);
+    EL3PCIClass *k = EL3_PCI_GET_CLASS(s);
+
     el3_core_reset(&s->core);
-    
-    /* Reset DMA engine state */
+    /* el3_core_reset clears bus_master_enabled (correct for the ISA parts,
+     * whose drivers re-arm DMA explicitly); on Boomerang the descriptor
+     * engines ARE the datapath -- keep them wired across reset. */
+    s->core.bus_master_enabled = k->has_dma;
+
     s->dma_engine.state = EL3_DMA_IDLE;
-    /* DMA engine will be initialized in realize */
-    
-    /* Cancel any pending bottom halves */
     if (s->dma_engine.tx_bh) {
         qemu_bh_cancel(s->dma_engine.tx_bh);
     }
@@ -321,144 +412,153 @@ static void pci_3c59x_reset(DeviceState *dev)
     }
 }
 
-/* VMState */
-static const VMStateDescription vmstate_pci_3c59x = {
-    .name = "3c59x",
+static const VMStateDescription vmstate_el3_pci = {
+    .name = "el3-pci",
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
-        VMSTATE_PCI_DEVICE(parent_obj, struct PCI3C59XState),
-        VMSTATE_STRUCT(core, PCI3C59XState, 0, vmstate_el3_core, EL3Core),
-        VMSTATE_STRUCT(dma_engine, PCI3C59XState, 0, vmstate_el3_dma_engine, EL3DMAEngine),
+        VMSTATE_PCI_DEVICE(parent_obj, struct EL3PCIState),
+        VMSTATE_STRUCT(core, EL3PCIState, 0, vmstate_el3_core, EL3Core),
+        VMSTATE_STRUCT(dma_engine, EL3PCIState, 0, vmstate_el3_dma_engine, EL3DMAEngine),
         VMSTATE_END_OF_LIST()
     }
 };
 
-/* Properties */
-static const Property pci_3c59x_properties[] = {
-    DEFINE_NIC_PROPERTIES(PCI3C59XState, core.conf),
+static const Property el3_pci_properties[] = {
+    DEFINE_NIC_PROPERTIES(EL3PCIState, core.conf),
 };
 
-/* IRQ handler for PCI variant */
-static void pci_3c59x_irq_handler(EL3Core *c, bool level)
+static void el3_pci_irq_handler(EL3Core *c, bool level)
 {
-    PCI3C59XState *s = container_of(c, PCI3C59XState, core);
+    EL3PCIState *s = container_of(c, EL3PCIState, core);
     pci_set_irq(PCI_DEVICE(s), level);
 }
 
-/* Variant operations for PCI */
-static const EL3VariantOps pci_3c59x_ops = {
-    .irq_set = pci_3c59x_irq_handler,
+/* 3C590 Vortex: windowed PIO datapath only (real Vortex has no descriptor
+ * rings; its Wn7 MasterAddr single-shot DMA is not modeled). */
+static const EL3VariantOps el3_pci_vortex_ops = {
+    .irq_set = el3_pci_irq_handler,
+    .has_dma = false,
+};
+
+/* 3C905 Boomerang: + descriptor-list bus-master engines. */
+static const EL3VariantOps el3_pci_boomerang_ops = {
+    .irq_set = el3_pci_irq_handler,
     .tx_kick = el3_pci_tx_kick,
     .rx_place_frame = el3_pci_rx_place_frame,
     .has_dma = true,
 };
 
-/* Device realization */
-static void pci_3c59x_realize(PCIDevice *dev, Error **errp)
+static void el3_pci_realize(PCIDevice *dev, Error **errp)
 {
-    PCI3C59XState *s = PCI_3C59X(dev);
+    EL3PCIState *s = EL3_PCI(dev);
+    EL3PCIClass *k = EL3_PCI_GET_CLASS(s);
     uint8_t *pci_conf = dev->config;
 
-    /* Set PCI config space IDs */
-    pci_config_set_vendor_id(pci_conf, 0x10B7);  /* 3Com vendor ID */
-    pci_config_set_device_id(pci_conf, 0x5900);  /* 3C590 Vortex device ID */
+    pci_config_set_vendor_id(pci_conf, 0x10B7);          /* 3Com */
+    pci_config_set_device_id(pci_conf, k->device_id);
     pci_config_set_class(pci_conf, PCI_CLASS_NETWORK_ETHERNET);
     pci_conf[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL;
-    
-    /* Enable bus mastering */
-    pci_conf[PCI_COMMAND] = PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
-    
-    /* Initialize core as Vortex with variant ops */
-    el3_core_init(&s->core, MODEL_3C590, &pci_3c59x_ops);
-    
-    /* Enable bus master mode in core */
-    s->core.bus_master_enabled = true;
-    
-    /* Setup MAC address */
+    pci_conf[PCI_INTERRUPT_PIN] = 1;                     /* INTA# */
+
+    el3_core_init(&s->core, k->model,
+                  k->has_dma ? &el3_pci_boomerang_ops : &el3_pci_vortex_ops);
+    s->core.bus_master_enabled = k->has_dma;
+
     qemu_macaddr_default_if_unset(&s->core.conf.macaddr);
-    
-    /* Create network interface */
-    s->core.nic = qemu_new_nic(&net_3c59x_info, &s->core.conf,
-                                TYPE_PCI_3C59X, DEVICE(dev)->id,
-                                &DEVICE(dev)->mem_reentrancy_guard, &s->core);
+    s->core.nic = qemu_new_nic(&net_el3_pci_info, &s->core.conf,
+                               object_get_typename(OBJECT(dev)), DEVICE(dev)->id,
+                               &DEVICE(dev)->mem_reentrancy_guard, &s->core);
     qemu_format_nic_info_str(qemu_get_queue(s->core.nic),
-                              s->core.conf.macaddr.a);
-    
-    /* Initialize EEPROM with MAC address */
+                             s->core.conf.macaddr.a);
+
     el3_eeprom_init_3c59x(&s->core);
-    
-    /* Setup I/O port BAR */
-    memory_region_init_io(&s->io, OBJECT(dev), &pci_3c59x_io_ops,
-                          s, TYPE_PCI_3C59X, PCI_3C59X_IO_SIZE);
+
+    memory_region_init_io(&s->io, OBJECT(dev), &el3_pci_io_ops,
+                          s, object_get_typename(OBJECT(dev)), PCI_EL3_IO_SIZE);
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
-    
-    /* Setup MMIO BAR */
-    memory_region_init_io(&s->mmio, OBJECT(dev), &pci_3c59x_mmio_ops,
-                          s, TYPE_PCI_3C59X, PCI_3C59X_MMIO_SIZE);
-    pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
-    
-    /* Setup IRQ - PCI devices handle IRQs internally */
-    /* IRQs are raised via pci_set_irq() in the variant ops */
-    
-    /* Initialize DMA engine bottom halves */
-    s->dma_engine.tx_bh = qemu_bh_new(el3_pci_tx_bh, s);
-    s->dma_engine.rx_bh = qemu_bh_new(el3_pci_rx_bh, s);
-    s->dma_engine.as = pci_get_address_space(dev);
-    s->dma_engine.opaque = s;
-    
-    /* Wire up DMA BH to core for scheduling */
-    s->core.dma_bh = s->dma_engine.tx_bh;
+
+    if (k->has_dma) {
+        s->dma_engine.tx_bh = qemu_bh_new(el3_pci_tx_bh, s);
+        s->dma_engine.rx_bh = qemu_bh_new(el3_pci_rx_bh, s);
+        s->dma_engine.as = pci_get_address_space(dev);
+        s->dma_engine.opaque = s;
+        s->core.dma_bh = s->dma_engine.tx_bh;
+        s->core.dma_as = pci_get_address_space(dev);
+    }
 }
 
-/* Device unrealize */
-static void pci_3c59x_unrealize(PCIDevice *dev)
+static void el3_pci_unrealize(PCIDevice *dev)
 {
-    PCI3C59XState *s = PCI_3C59X(dev);
-    
-    /* Cleanup bottom halves */
+    EL3PCIState *s = EL3_PCI(dev);
+
     if (s->dma_engine.tx_bh) {
         qemu_bh_delete(s->dma_engine.tx_bh);
     }
     if (s->dma_engine.rx_bh) {
         qemu_bh_delete(s->dma_engine.rx_bh);
     }
-    
-    /* Cleanup network interface */
     qemu_del_nic(s->core.nic);
 }
 
-/* Class initialization */
-static void pci_3c59x_class_init(ObjectClass *klass, const void *data)
+static void el3_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
-    
-    pc->realize = pci_3c59x_realize;
-    pc->exit = pci_3c59x_unrealize;
-    dc->legacy_reset = pci_3c59x_reset;
-    dc->desc = "3Com 3C590 Vortex";
-    dc->vmsd = &vmstate_pci_3c59x;
-    device_class_set_props(dc, pci_3c59x_properties);
+
+    pc->realize = el3_pci_realize;
+    pc->exit = el3_pci_unrealize;
+    dc->legacy_reset = el3_pci_reset;
+    dc->vmsd = &vmstate_el3_pci;
+    device_class_set_props(dc, el3_pci_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
 
-/* Type info */
-static const TypeInfo pci_3c59x_info = {
-    .name = TYPE_PCI_3C59X,
-    .parent = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(PCI3C59XState),
-    .class_init = pci_3c59x_class_init,
-    .interfaces = (InterfaceInfo[]) {
-        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
-        { },
+static void el3_pci_3c590_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    EL3PCIClass *k = EL3_PCI_CLASS(klass);
+
+    dc->desc = "3Com 3C590 Vortex (PCI, PIO)";
+    k->device_id = 0x5900;
+    k->model = MODEL_3C590;
+    k->has_dma = false;
+}
+
+static void el3_pci_3c905_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    EL3PCIClass *k = EL3_PCI_CLASS(klass);
+
+    dc->desc = "3Com 3C905 Boomerang (PCI, descriptor DMA)";
+    k->device_id = 0x9050;
+    k->model = MODEL_3C905;
+    k->has_dma = true;
+}
+
+static const TypeInfo el3_pci_types[] = {
+    {
+        .name          = TYPE_EL3_PCI,
+        .parent        = TYPE_PCI_DEVICE,
+        .instance_size = sizeof(EL3PCIState),
+        .class_size    = sizeof(EL3PCIClass),
+        .class_init    = el3_pci_class_init,
+        .abstract      = true,
+        .interfaces    = (InterfaceInfo[]) {
+            { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+            { },
+        },
+    },
+    {
+        .name          = "3c590",
+        .parent        = TYPE_EL3_PCI,
+        .class_init    = el3_pci_3c590_class_init,
+    },
+    {
+        .name          = "3c905",
+        .parent        = TYPE_EL3_PCI,
+        .class_init    = el3_pci_3c905_class_init,
     },
 };
 
-/* Type registration */
-static void pci_3c59x_register_types(void)
-{
-    type_register_static(&pci_3c59x_info);
-}
-
-type_init(pci_3c59x_register_types)
+DEFINE_TYPES(el3_pci_types)

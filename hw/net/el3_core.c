@@ -502,19 +502,29 @@ static void el3_process_command(EL3Core *c, uint16_t cmd)
         trace_el3_tx_start(param);
         break;
         
-    case 0x06: /* DMA stall/unstall commands (3C515) */
+    case 0x06: /* StallCtl: DMA stall/unstall (3C515/59x/90x) */
         switch (param & 0x03) {
         case 0: /* UpStall */
             c->up_stalled = true;
             break;
         case 1: /* UpUnstall */
             c->up_stalled = false;
+            /* The up engine resumes: deliver frames queued while the head
+             * UPD was still owned by the driver (rx_place_frame returned 0). */
+            if (c->nic) {
+                qemu_flush_queued_packets(qemu_get_queue(c->nic));
+            }
             break;
         case 2: /* DownStall */
             c->down_stalled = true;
             break;
         case 3: /* DownUnstall */
             c->down_stalled = false;
+            /* Resume the download engine at the preserved DnListPtr (no-op
+             * for variants without a descriptor walker, e.g. ISA single-shot). */
+            if (c->ops && c->ops->tx_kick) {
+                c->ops->tx_kick(c);
+            }
             break;
         }
         break;
@@ -2052,7 +2062,11 @@ void el3_core_reset(EL3Core *c)
     c->up_stalled = false;
     c->down_stalled = false;
     c->rx_dma_armed = false;
-    c->bus_master_enabled = false;
+    /* Bus-master capability follows the variant, and must survive the guest's
+     * own GlobalReset (drivers issue it at probe): on Boomerang-class parts the
+     * descriptor engines ARE the datapath. Only the rx_place_frame dispatch
+     * consumes this, so it is inert for variants without a placer. */
+    c->bus_master_enabled = (c->ops && c->ops->has_dma);
     c->irq_level = false;
     
     /* Reset TX backpressure state */
