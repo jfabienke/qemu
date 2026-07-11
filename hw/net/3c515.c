@@ -19,6 +19,7 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "system/address-spaces.h"   /* get_system_io: DMA block needs overlap priority */
 
 #define TYPE_ISA_3C515 "3c515"
 OBJECT_DECLARE_SIMPLE_TYPE(ISA3C515State, ISA_3C515)
@@ -29,12 +30,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ISA3C515State, ISA_3C515)
  * ports (COM/floppy/etc.) between 0x20 and 0x2000. */
 #define ISA_3C515_EEPROM_ALIAS  0x2000
 #define ISA_3C515_EEPROM_SIZE   0x10
-/* Bus-master DMA register block. On the real Corkscrew (and the 3c59x family) the master
- * registers sit right after the windowed block at base+0x20..0x3F: DownListPtr = base+0x24
- * (region offset 0x04), UpListPtr = base+0x38 (region offset 0x18). NOT base+0x400 -- that
- * port (0x700 with iobase 0x300) gets shadowed by the PCI host bridge I/O window after BIOS
- * setup, so writes there never reach this region. */
-#define ISA_3C515_DMA_BASE      0x20
+/* HARDWARE-TRUE: the real Corkscrew aliases the Boomerang master-control block
+ * at iobase+0x400 (Becker 3c515.c `MasterCtrl`: DownListPtr 0x404, UpListPtr
+ * 0x418); the card's windowed ISA extent stops at 0x1F, so the former +0x20
+ * mapping (the 90x PCI layout) was never decoded by real silicon. On -M pc the
+ * PCI host bridge shadows this port range, so the region is registered with
+ * overlap priority (see realize). */
+#define ISA_3C515_DMA_BASE      0x400
 #define ISA_3C515_DMA_SIZE      0x20
 #define ISA_3C515_DEFAULT_IOBASE 0x300
 #define ISA_3C515_DEFAULT_IRQ   10
@@ -99,34 +101,55 @@ static const MemoryRegionOps isa_3c515_eeprom_ops = {
 };
 
 /* Bus-master DMA registers (base+0x400). DownListPtr (0x04)/UpListPtr (0x18) are 32-bit, but
- * a 286 driver writes each as two 16-bit halves -- handle both. The descriptor is processed
- * when the driver issues the StartDmaDown command (handled in el3_process_command). */
+ * a 286 driver writes each as two 16-bit halves -- handle both.
+ *
+ * HARDWARE-TRUE start semantics: writing a non-zero list pointer starts the engine (Linux
+ * 3c515.c start_xmit writes DownListPtr alone; iPXE patches DnNextPtr under stall and writes
+ * DnListPtr when it reads 0). With split 16-bit writes the pointer is complete only after the
+ * HIGH half, so a 16-bit low-half write only latches; the high-half write (or a full 32-bit
+ * write) triggers. StartDmaUp/Down (cmd 0x14) still works as the legacy trigger. A null
+ * UpListPtr disarms the up engine (the driver's release path). */
 static void isa_3c515_dma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     ISA3C515State *s = opaque;
+    bool dn_go = false, up_go = false;
+
     switch (addr) {
     case 0x04: /* DownListPtr (low half, or full 32-bit) */
         if (size == 4) {
             s->core.down_list_ptr = (uint32_t)val;
+            dn_go = true;
         } else {
             s->core.down_list_ptr = (s->core.down_list_ptr & 0xFFFF0000u) | (val & 0xFFFFu);
         }
         break;
-    case 0x06: /* DownListPtr high half */
+    case 0x06: /* DownListPtr high half -> pointer complete */
         s->core.down_list_ptr = (s->core.down_list_ptr & 0x0000FFFFu) | ((val & 0xFFFFu) << 16);
+        dn_go = true;
         break;
     case 0x18: /* UpListPtr (low half, or full 32-bit) */
         if (size == 4) {
             s->core.up_list_ptr = (uint32_t)val;
+            up_go = true;
         } else {
             s->core.up_list_ptr = (s->core.up_list_ptr & 0xFFFF0000u) | (val & 0xFFFFu);
         }
         break;
-    case 0x1A: /* UpListPtr high half */
+    case 0x1A: /* UpListPtr high half -> pointer complete */
         s->core.up_list_ptr = (s->core.up_list_ptr & 0x0000FFFFu) | ((val & 0xFFFFu) << 16);
+        up_go = true;
         break;
     default:
         break;
+    }
+
+    if (dn_go && s->core.down_list_ptr && s->core.dma_as) {
+        s->core.down_stalled = false;
+        el3_core_dma_tx_single(&s->core, s->core.dma_as, s->core.down_list_ptr);
+    }
+    if (up_go) {
+        s->core.up_stalled = false;
+        s->core.rx_dma_armed = (s->core.up_list_ptr != 0);
     }
 }
 
@@ -247,7 +270,14 @@ static void isa_3c515_realize(DeviceState *dev, Error **errp)
     s->core.dma_as = &address_space_memory;
     memory_region_init_io(&s->dma_io, OBJECT(dev), &isa_3c515_dma_ops,
                           s, "3c515-dma", ISA_3C515_DMA_SIZE);
-    isa_register_ioport(isa, &s->dma_io, s->iobase + ISA_3C515_DMA_BASE);
+    /* Register with OVERLAP PRIORITY 1: on -M pc the PCI host bridge claims a
+     * broad I/O window that shadows iobase+0x400 (0x700) after BIOS setup, so a
+     * plain isa_register_ioport there never sees the writes -- the reason this
+     * block was previously (non-hardware-true) parked at +0x20. An ISA add-in
+     * card's decode wins on a real bus; priority 1 models that. */
+    memory_region_add_subregion_overlap(get_system_io(),
+                                        s->iobase + ISA_3C515_DMA_BASE,
+                                        &s->dma_io, 1);
 
     /* Setup IRQ */
     s->irq_line = isa_get_irq(isa, s->irq);

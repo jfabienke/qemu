@@ -632,6 +632,12 @@ static void el3_tx_drain_timer_cb(void *opaque)
         }
         el3_update_irq(c);
     }
+    if (completed && c->ops && c->ops->tx_kick) {
+        /* Completion slots freed: resume a descriptor walker that parked itself
+         * on a full pend queue (PCI Boomerang paced mode). No-op for variants
+         * without a walker. */
+        c->ops->tx_kick(c);
+    }
     if (c->dn_pend_n > 0) {
         timer_mod_ns(c->tx_timer, c->dn_pend[0].due_ns);
         return;
@@ -1143,8 +1149,12 @@ ssize_t el3_core_receive(NetClientState *nc, const uint8_t *buf, size_t size)
         return size;
     }
 
-    /* Handle bus master DMA mode (3C515/59x) */
-    if (c->bus_master_enabled && c->ops && c->ops->rx_place_frame) {
+    /* Handle bus master DMA mode (3C515/59x). The upload engine takes over RX
+     * only once a list is armed (UpListPtr != 0) -- with no list the RX FIFO is
+     * the substrate and frames flow to the windowed PIO path below, which is
+     * what a PIO-RX driver (ours: RX-always-PIO) relies on. */
+    if (c->bus_master_enabled && c->ops && c->ops->rx_place_frame &&
+        c->up_list_ptr) {
         uint32_t rx_status = 0;
         
         /* Build RX status - no errors for good frames */

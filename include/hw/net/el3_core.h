@@ -373,8 +373,12 @@ typedef struct {
 /* DMA descriptor flags */
 #define EL3_DESC_DMA_DONE    0x00010000  /* DMA transfer complete */
 #define EL3_DESC_DMA_INDICATE 0x00008000 /* Generate interrupt when done */
-#define EL3_DESC_DOWN_COMPLETE 0x00004000 /* Download complete */
-#define EL3_DESC_UP_COMPLETE   0x00004000 /* Upload complete */
+/* HARDWARE-TRUE completion write-backs (Becker 3c515.c/3c59x.c + iPXE 3c90x,
+ * unanimous): download complete = FSH bit 16 (fshDnComplete); upload complete =
+ * UpPktStatus bit 15 (upComplete). The former 0x4000 placeholder matched only
+ * this model's own DOS driver and would have failed on real Corkscrew silicon. */
+#define EL3_DESC_DOWN_COMPLETE 0x00010000 /* FSH bit16: download complete */
+#define EL3_DESC_UP_COMPLETE   0x00008000 /* UpPktStatus bit15: upload complete */
 #define EL3_DESC_UP_ERROR      0x00002000 /* Upload error */
 #define EL3_DESC_DOWN_ERROR    0x00002000 /* Download error */
 #define EL3_DESC_LENGTH_MASK   0x00001FFF /* Length field mask */
