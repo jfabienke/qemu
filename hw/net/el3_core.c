@@ -219,6 +219,42 @@ static const EL3Caps el3_caps[] = {
         .rx_fifo_bytes = 2048,
         .max_windows = 8,
     },
+    [MODEL_3C590] = {
+        /* Vortex 10 Mbit PCI: windowed PIO datapath (our badge models no DMA). */
+        .has_mii = false,
+        .has_bus_master = true,
+        .has_full_duplex = true,
+        .is_100mbit = false,
+        .has_vlan_support = false,
+        .ram_bytes = 0,
+        .tx_fifo_bytes = 2048,
+        .rx_fifo_bytes = 2048,
+        .max_windows = 8,
+    },
+    [MODEL_3C595] = {
+        /* Vortex 100 Mbit PCI. */
+        .has_mii = true,
+        .has_bus_master = true,
+        .has_full_duplex = true,
+        .is_100mbit = true,
+        .has_vlan_support = false,
+        .ram_bytes = 0,
+        .tx_fifo_bytes = 2048,
+        .rx_fifo_bytes = 2048,
+        .max_windows = 8,
+    },
+    [MODEL_3C900] = {
+        /* Boomerang 10 Mbit PCI. */
+        .has_mii = false,
+        .has_bus_master = true,
+        .has_full_duplex = true,
+        .is_100mbit = false,
+        .has_vlan_support = false,
+        .ram_bytes = 8192,
+        .tx_fifo_bytes = 2048,   /* PIO FIFO still exists alongside the DMA engines */
+        .rx_fifo_bytes = 2048,
+        .max_windows = 8,
+    },
     [MODEL_3C905] = {
         .has_mii = true,
         .has_bus_master = true,
@@ -226,8 +262,8 @@ static const EL3Caps el3_caps[] = {
         .is_100mbit = true,
         .has_vlan_support = false,
         .ram_bytes = 8192,
-        .tx_fifo_bytes = 0,  /* Uses RAM buffer */
-        .rx_fifo_bytes = 0,  /* Uses RAM buffer */
+        .tx_fifo_bytes = 2048,   /* PIO FIFO still exists alongside the DMA engines */
+        .rx_fifo_bytes = 2048,
         .max_windows = 8,
     },
     [MODEL_3C905B] = {
@@ -237,8 +273,20 @@ static const EL3Caps el3_caps[] = {
         .is_100mbit = true,
         .has_vlan_support = true,
         .ram_bytes = 8192,
-        .tx_fifo_bytes = 0,
-        .rx_fifo_bytes = 0,
+        .tx_fifo_bytes = 2048,
+        .rx_fifo_bytes = 2048,
+        .max_windows = 8,
+    },
+    [MODEL_3C905C] = {
+        /* Tornado: Cyclone-compatible datapath. */
+        .has_mii = true,
+        .has_bus_master = true,
+        .has_full_duplex = true,
+        .is_100mbit = true,
+        .has_vlan_support = true,
+        .ram_bytes = 8192,
+        .tx_fifo_bytes = 2048,
+        .rx_fifo_bytes = 2048,
         .max_windows = 8,
     },
 };

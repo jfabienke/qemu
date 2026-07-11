@@ -389,6 +389,10 @@ static NetClientInfo net_el3_pci_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
     .receive = el3_core_receive,
+    /* PIO-FIFO backpressure (queue instead of drop on overflow) -- absence of
+     * this hook was the ISA models' RX-burst-loss cliff. Inert for the DMA
+     * badge (its frames bypass the FIFO, so the FIFO never fills). */
+    .can_receive = el3_core_can_receive,
     .link_status_changed = el3_core_set_link_status,
 };
 
