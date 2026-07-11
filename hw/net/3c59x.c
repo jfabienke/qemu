@@ -83,10 +83,16 @@ OBJECT_DECLARE_TYPE(EL3PCIState, EL3PCIClass, EL3_PCI)
 #define PCI_EL3_MAX_FRAGS    16      /* fragment pairs per DPD */
 #define PCI_EL3_MAX_FRAME    4608    /* matches the core's FDDI-scale TX slot */
 
-/* PCI bus-master rate for the realtiming model: even early PCI moves ~25 MB/s
- * sustained, so the 100 Mbit wire (12.5 MB/s) dominates -- unlike ISA, where the
- * ~6 MB/s bus is the wall. Tunable via the dma_rate property. */
-#define PCI_EL3_DEFAULT_DMA_RATE (25 * 1024 * 1024)
+/* PCI bus-master rate for the realtiming model. Real early PCI moves ~25 MB/s
+ * sustained (the 100 Mbit wire would dominate) -- but under icount the resulting
+ * ~121 us per-frame completion cadence RACES the guest's wait entry: completions
+ * that fire before the guest reaches its sti/hlt turn into PIT-quantum (55 ms)
+ * missed-wakeup stalls (measured: 32K writes 165 KB/s at 25 MB/s, 931 at 8 MB/s,
+ * 5509 at 6 MB/s -- the 251 us cadence is reliably on the stable side). Default
+ * to the stable cadence: timed-mode PCI DMA models a conservative ~6 MB/s and
+ * still shows the correct shape (DMA > PIO > ISA); the real-PCI headroom claim
+ * rides on instant-mode/real-target runs. Tunable via the dma_rate property. */
+#define PCI_EL3_DEFAULT_DMA_RATE (6 * 1024 * 1024)
 
 struct EL3PCIState {
     PCIDevice parent_obj;
@@ -345,8 +351,13 @@ static void el3_pci_tx_kick(EL3Core *c)
 {
     EL3PCIState *s = container_of(c, EL3PCIState, core);
 
-    if (s->dma_engine.tx_bh) {
-        qemu_bh_schedule(s->dma_engine.tx_bh);
+    /* Process SYNCHRONOUSLY (same as the ISA single-transfer path, which runs
+     * in the I/O-write context): a per-frame bottom-half dispatch adds an
+     * event-loop round trip that icount charges as virtual-time skew -- it
+     * throttled paced DMA writes ~10x below the modeled wire rate. All call
+     * sites (BAR write, drain timer, completion cb) hold the BQL. */
+    if (!c->down_stalled && c->down_list_ptr) {
+        el3_pci_process_tx_chain(s);
     }
 }
 
