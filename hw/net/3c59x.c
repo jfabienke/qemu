@@ -238,8 +238,11 @@ static void el3_pci_process_tx_chain(EL3PCIState *s)
             timer_mod_ns(c->tx_timer, c->dn_pend[0].due_ns);
             c->tx_in_progress = true;
         } else {
-            /* Hardware write-back: FSH |= dnComplete (never touches next/frags). */
-            el3_pci_dma_write_status(s, current, fsh | FSH_DN_COMPLETE);
+            /* Hardware write-back: FSH |= dnComplete (never touches next/frags).
+             * R2: suppressed when dn_writeback=off (90x keeps it on -- iPXE polls it). */
+            if (c->dn_writeback) {
+                el3_pci_dma_write_status(s, current, fsh | FSH_DN_COMPLETE);
+            }
 
             if (fsh & FSH_DN_INDICATE) {
                 c->status |= STAT_DOWN_COMPLETE;
@@ -515,6 +518,9 @@ static const Property el3_pci_properties[] = {
     DEFINE_PROP_BOOL("realtiming", EL3PCIState, core.realtiming, false),
     DEFINE_PROP_UINT16("linkspeed", EL3PCIState, linkspeed, 100),
     DEFINE_PROP_UINT32("dma_rate", EL3PCIState, dma_rate_bps, PCI_EL3_DEFAULT_DMA_RATE),
+    /* R2 (docs/12): default on = hardware-true. On 90x the write-back is proven (iPXE polls it),
+     * so this stays on in practice; exposed for symmetry with the Corkscrew fallback test. */
+    DEFINE_PROP_BOOL("dn_writeback", EL3PCIState, core.dn_writeback, true),
     DEFINE_NIC_PROPERTIES(EL3PCIState, core.conf),
 };
 

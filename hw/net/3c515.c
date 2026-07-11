@@ -292,6 +292,9 @@ static const Property isa_3c515_properties[] = {
     DEFINE_PROP_UINT8("irq", ISA3C515State, irq, ISA_3C515_DEFAULT_IRQ),
     DEFINE_PROP_BOOL("realtiming", ISA3C515State, core.realtiming, false),
     DEFINE_PROP_UINT16("linkspeed", ISA3C515State, linkspeed, 100),
+    /* R2 (docs/12): suppress the fshDnComplete write-back to CI-test the driver's dual-evidence
+     * retirement (retire iff DownListPtr==0). Default on = hardware-true Corkscrew behavior. */
+    DEFINE_PROP_BOOL("dn_writeback", ISA3C515State, core.dn_writeback, true),
     DEFINE_PROP_BOOL("pnp", ISA3C515State, pnp_enable, true),
     DEFINE_PROP_UINT32("dma_rate", ISA3C515State, dma_rate_bps, ISA_3C515_DEFAULT_DMA_RATE),
     DEFINE_PROP_STRING("romfile", ISA3C515State, romfile),

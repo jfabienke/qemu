@@ -613,10 +613,19 @@ static void el3_tx_drain_timer_cb(void *opaque)
      * driver-owned next/addr/len fields are untouched), then raise TxComplete once for the
      * batch. While entries remain, the timer belongs to the next pending deadline. */
     while (c->dn_pend_n > 0 && c->dn_pend[0].due_ns <= now) {
-        if (c->dma_as) {
+        if (c->dma_as && c->dn_writeback) {
             uint32_t st = c->dn_pend[0].status;
             address_space_write(c->dma_as, c->dn_pend[0].addr + 4,
                                 MEMTXATTRS_UNSPECIFIED, &st, sizeof(st));
+        }
+        /* R2 dual-evidence: the engine has now consumed this (always NEXT=0) descriptor, so
+         * DownListPtr reads 0 -- the driver's fallback retires on this alone when the write-back
+         * is suppressed. Deferred to the paced deadline (not fetch) so a foreground poll can't
+         * retire+refill the slot before the write-back above has landed. Guarded on a match so a
+         * driver that already re-kicked a newer descriptor keeps its live pointer. No-op for the
+         * PCI walker, which set DownListPtr at its natural chain end. */
+        if (c->down_list_ptr == c->dn_pend[0].addr) {
+            c->down_list_ptr = 0;
         }
         c->dn_pend_n--;
         memmove(&c->dn_pend[0], &c->dn_pend[1],
@@ -1680,7 +1689,14 @@ void el3_core_dma_tx_single(EL3Core *c, AddressSpace *as, hwaddr desc_addr)
     } else {
         /* non-realtiming (or pend table full -- shouldn't happen with a 4-deep driver ring):
          * complete synchronously */
-        address_space_write(as, desc_addr, MEMTXATTRS_UNSPECIFIED, &d, sizeof(d));
+        if (c->dn_writeback) {
+            address_space_write(as, desc_addr, MEMTXATTRS_UNSPECIFIED, &d, sizeof(d));
+        }
+        /* R2 dual-evidence: engine consumed the single-descriptor list -> DownListPtr reads 0
+         * (the fallback's retire condition when the write-back above is suppressed). */
+        if (c->down_list_ptr == desc_addr) {
+            c->down_list_ptr = 0;
+        }
         c->status |= STAT_TX_COMPLETE;
         c->int_status |= STAT_TX_COMPLETE;
         el3_update_irq(c);

@@ -670,6 +670,13 @@ struct EL3Core {
      *     window and read the placeholder. The TX wire-time model is unaffected (pure virtual
      *     clock). Use shift=10 for EEPROM-correct realtiming runs. */
     bool realtiming;             /* model hardware delays (else instant) */
+    /* R2 (docs/12): fshDnComplete write-back is proven on 90x silicon but only *documented* for
+     * the Corkscrew -- Becker's 3c515.c never reads it, retiring by DownListPtr register
+     * comparison instead. dn_writeback=false suppresses the DN_COMPLETE status write-back on the
+     * ISA single-transfer path so the driver's dual-evidence fallback (retire iff DownListPtr==0)
+     * is CI-testable. The engine still zeroes DownListPtr at the paced completion deadline, so the
+     * fallback retires on the same cadence the write-back would have. Default true. */
+    bool dn_writeback;
     uint32_t tx_ns_per_byte;     /* wire time per byte (10BaseT = 800 ns) */
     int64_t tx_drain_deadline_ns;/* virtual-clock time when the TX FIFO finishes draining */
     QEMUTimer *tx_timer;         /* fires at the drain deadline -> TxComplete + IRQ */
