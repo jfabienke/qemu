@@ -460,8 +460,13 @@ static void el3_process_command(EL3Core *c, uint16_t cmd)
         break;
         
     case 0x0D: /* AckIntr */
-        /* Acknowledge and clear interrupt bits specified in param */
-        c->int_status &= ~(param & 0xFF);
+        /* Acknowledge and clear interrupt bits specified in param. The AckIntr arg is the full
+         * 11-bit field (param = cmd & 0x7FF), so UpComplete(0x400)/DownComplete(0x200) are ackable
+         * here exactly as on real 3c59x (Linux/iPXE issue AckIntr|UpComplete). Masking to 0xFF made
+         * those two impossible to clear -- harmless on the edge ISA 515 (a stuck bit raises no new
+         * edge) but a fatal interrupt storm on the level-triggered PCI 90x INTx once RX-DMA (the
+         * driver's N-slot UP ring) started raising UpComplete. */
+        c->int_status &= ~(param & 0x7FF);
         /* AckIntr(InterruptLatch) explicitly clears the latch even while other indications remain
          * pending -- the ISR acks the latch, then reads status & 0x0F as the dispatch reason. */
         if (param & STAT_INT_LATCH) {
@@ -472,6 +477,9 @@ static void el3_process_command(EL3Core *c, uint16_t cmd)
          * path) sees a stale TxComplete on the NEXT unrelated IRQ and never waits for its own
          * transfer -- defeating realtiming DMA pacing. */
         c->status &= ~(param & STAT_TX_COMPLETE);
+        /* Up/DownComplete are edge indications too: clear the readable status on ack so a driver
+         * polling status doesn't see a stale completion on the next unrelated IRQ. */
+        c->status &= ~(param & (STAT_UP_COMPLETE | STAT_DOWN_COMPLETE));
         /* RX_COMPLETE: for PIO the ISR re-checks the RX FIFO and RX_DISCARD clears it, so leave it
          * while frames remain (rx_packet_count > 0). For RX-DMA there is no FIFO (rx_packet_count
          * stays 0), so AckIntr(RxComplete) must clear the readable RX_COMPLETE -- else it stays
