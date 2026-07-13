@@ -840,10 +840,14 @@ void el3_eeprom_init_3c59x(EL3Core *c)
     memset(c->eeprom, 0, sizeof(c->eeprom));
     
     /* 3C59x uses different EEPROM layout */
-    /* Node address at 0x10-0x12 instead of 0x00-0x02 */
-    c->eeprom[0x10] = (c->conf.macaddr.a[1] << 8) | c->conf.macaddr.a[0];
-    c->eeprom[0x11] = (c->conf.macaddr.a[3] << 8) | c->conf.macaddr.a[2];
-    c->eeprom[0x12] = (c->conf.macaddr.a[5] << 8) | c->conf.macaddr.a[4];
+    /* Node address at 0x10-0x12 instead of 0x00-0x02. Stored BIG-endian per word (MSB = first
+     * MAC byte), same as the ISA parts and real silicon: Becker's 3c59x.c reads dev_addr as
+     * htons(eeprom[i]) -- mac[0] is the HIGH byte of word 0. The previous little-endian packing
+     * word-swapped the station address (invisible over slirp, which never validates MACs;
+     * caught by the first guest-to-guest 2-VM ingress, task #87). */
+    c->eeprom[0x10] = (c->conf.macaddr.a[0] << 8) | c->conf.macaddr.a[1];
+    c->eeprom[0x11] = (c->conf.macaddr.a[2] << 8) | c->conf.macaddr.a[3];
+    c->eeprom[0x12] = (c->conf.macaddr.a[4] << 8) | c->conf.macaddr.a[5];
     
     /* OEM node address copy at 0x0A-0x0C */
     c->eeprom[0x0A] = c->eeprom[0x10];

@@ -212,6 +212,14 @@ static void el3_pci_process_tx_chain(EL3PCIState *s)
             if (EL3_PCI_GET_CLASS(s)->has_csum && (fsh & FSH_ADD_ANY_CSUM)) {
                 net_checksum_calculate(buf, total_len, CSUM_ALL);
             }
+            /* Pad short frames to the Ethernet minimum, like the real MAC (and like the ISA
+             * el3_core_dma_tx_single path). Without this a 42-byte ARP goes out as a runt and
+             * a peer el3 rightly drops it -- invisible over slirp (accepts runts), fatal on the
+             * guest-to-guest rig (task #87). buf is EL3_LARGE_FRAME_MAX-sized, so this is safe. */
+            if (total_len < ETH_MIN_DATA_NOFCS) {
+                memset(buf + total_len, 0, ETH_MIN_DATA_NOFCS - total_len);
+                total_len = ETH_MIN_DATA_NOFCS;
+            }
             qemu_send_packet(qemu_get_queue(c->nic), buf, total_len);
             c->stats.tx_frames_ok++;
             c->stats.tx_bytes_ok += total_len;
