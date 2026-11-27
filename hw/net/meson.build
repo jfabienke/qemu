@@ -69,4 +69,9 @@ system_ss.add(when: 'CONFIG_ROCKER', if_true: files(
 stub_ss.add(files('rocker/rocker-stubs.c'))
 system_ss.add(files('rocker/rocker-hmp-cmds.c'))
 
+# elink-qemu: 3Com EtherLink emulation
+system_ss.add(when: 'CONFIG_EL3_509', if_true: files('3c509.c', 'el3_core.c'))
+system_ss.add(when: 'CONFIG_EL3_515', if_true: files('3c515.c', 'el3_core.c'))
+system_ss.add(when: 'CONFIG_EL3_59X', if_true: files('3c59x.c', 'el3_core.c'))
+
 subdir('can')

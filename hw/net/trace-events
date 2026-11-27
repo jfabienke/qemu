@@ -528,3 +528,116 @@ xen_netdev_rx(int dev, int idx, int status, int flags) "vif%u idx %d status %d f
 ethlite_pkt_lost(uint32_t rx_ctrl) "rx_ctrl:0x%" PRIx32
 ethlite_pkt_size_too_big(uint64_t size) "size:0x%" PRIx64
 ethlite_pkt_tx_size_too_big(uint64_t size) "size:0x%" PRIx64
+
+# ---- elink-qemu: 3Com EtherLink III family ----
+# 3Com EtherLink III trace events
+
+# el3_core.c
+el3_window_select(int window) "window=%d"
+el3_command(uint16_t cmd, uint16_t param) "cmd=0x%04x param=0x%04x"
+el3_cmd(uint16_t cmd, uint16_t arg) "cmd=0x%04x arg=0x%04x"
+el3_cmd_ignored(uint16_t cmd, const char *reason) "cmd=0x%04x ignored: %s"
+el3_read(uint32_t addr, uint32_t val, int size, int window) "addr=0x%02x val=0x%08x size=%d window=%d"
+el3_write(uint32_t addr, uint32_t val, int size, int window) "addr=0x%02x val=0x%08x size=%d window=%d"
+
+# EEPROM operations
+el3_eeprom_cmd(uint16_t cmd, uint8_t addr) "cmd=0x%04x addr=0x%02x"
+el3_eeprom_start(uint8_t addr) "addr=0x%02x"
+el3_eeprom_done(uint8_t addr, uint16_t val) "addr=0x%02x val=0x%04x"
+el3_eeprom_read(uint16_t data, bool busy) "data=0x%04x busy=%d"
+
+# Interrupt handling
+el3_irq_update(bool raise, uint16_t status, uint16_t mask) "raise=%d status=0x%04x mask=0x%04x"
+el3_irq_raise(uint16_t status) "raising IRQ, status=0x%04x"
+el3_irq_lower(void) "lowering IRQ"
+el3_irq_status_change(uint16_t old, uint16_t new) "IRQ status changed: 0x%04x -> 0x%04x"
+
+# FIFO operations
+el3_fifo_read(const char *fifo, size_t bytes, size_t remaining) "%s FIFO read %zu bytes, %zu remaining"
+el3_fifo_write(const char *fifo, size_t bytes, size_t total) "%s FIFO write %zu bytes, total %zu"
+el3_fifo_reset(const char *fifo) "%s FIFO reset"
+el3_fifo_overflow(const char *fifo, size_t requested, size_t available) "%s FIFO overflow: requested=%zu available=%zu"
+el3_fifo_underflow(const char *fifo, size_t requested, size_t available) "%s FIFO underflow: requested=%zu available=%zu"
+el3_fifo_threshold(const char *fifo, uint16_t threshold) "%s FIFO threshold set to %u"
+
+# Network operations - RX
+el3_rx_accept(size_t len) "len=%zu"
+el3_rx_drop(size_t len, const char *reason) "len=%zu reason=%s"
+el3_rx_packet(size_t len, uint16_t status) "len=%zu status=0x%04x"
+el3_rx_error(const char *type) "error=%s"
+el3_rx_fifo_write(size_t len, size_t used, size_t free) "wrote %zu bytes, used=%zu free=%zu"
+el3_rx_header(uint16_t status, uint16_t length) "status=0x%04x length=%u"
+el3_rx_discard(size_t len) "discarding %zu bytes"
+el3_rx_overflow(size_t len, size_t available) "overflow: packet=%zu available=%zu"
+el3_rx_filter_drop(uint32_t filter, const char *reason) "filter=0x%08x reason=%s"
+el3_rx_loopback(size_t len) "loopback packet len=%zu"
+el3_tx_packet(size_t len) "len=%zu"
+el3_tx_start(uint16_t len) "len=%u"
+el3_tx_complete(uint8_t status) "status=0x%02x"
+el3_tx_underrun(void) ""
+el3_tx_oversize(size_t len) "len=%zu (emulator defensive drop)"
+el3_tx_zero_length(void) "zero-length frame dropped (bad length)"
+el3_tx_fifo_empty(size_t expected, size_t available) "expected=%zu available=%zu (underrun)"
+el3_tx_padding(size_t from, size_t to) "padded from %zu to %zu bytes"
+el3_link_status(const char *status) "link=%s"
+
+# Statistics
+el3_stats_enable(void) ""
+el3_stats_disable(void) ""
+el3_stats_zero(void) ""
+el3_stats_update(bool tx, bool ok, size_t bytes, uint8_t frames_counter) "tx=%d ok=%d bytes=%zu frames_counter=%u"
+el3_stats_saturate(const char *counter, uint32_t value) "counter=%s saturated at %u"
+
+# Filter operations
+el3_filter_set(uint16_t filter) "filter=0x%04x"
+
+# ISA ID sequence
+el3_id_write(uint8_t val) "val=0x%02x"
+el3_id_read(uint8_t data, int pos) "data=0x%02x pos=%d"
+el3_id_reset(void) ""
+el3_id_lfsr(uint8_t state, uint8_t next) "state=0x%02x next=0x%02x"
+
+# Migration
+el3_migration_save(int timers_active, int phy_present) "saving state: timers_active=%d phy_present=%d"
+el3_migration_load(int version, int timers_loaded, int phy_loaded) "loading state: version=%d timers_loaded=%d phy_loaded=%d"
+el3_timer_rearm(const char *timer, int64_t deadline, int64_t now) "%s timer rearm: deadline=%" PRId64 " now=%" PRId64
+el3_subsection_missing(const char *name) "subsection %s not present in migration stream"
+
+# DMA operations
+el3_dma_desc_read(uint32_t addr, uint32_t next, uint32_t status, uint32_t buffer, uint32_t length) "desc@0x%06x: next=0x%06x status=0x%08x buffer=0x%06x length=0x%08x"
+el3_dma_desc_status_write(uint32_t addr, uint32_t status) "desc@0x%06x: status=0x%08x"
+el3_dma_error(uint32_t addr, const char *reason) "DMA error at 0x%06x: %s"
+el3_validate_dma_address(uint32_t addr, uint32_t len, const char *op) "DMA validation OK: addr=0x%06x len=%u op=%s"
+el3_dma_budget_refill(uint32_t bytes) "DMA budget refilled: %u bytes"
+el3_dma_budget_exceeded(uint32_t requested, uint32_t available) "DMA budget exceeded: requested=%u available=%u"
+el3_dma_stalled(const char *direction) "%s DMA stalled"
+el3_dma_not_owned(uint32_t addr, const char *direction) "%s desc@0x%06x not owned by device"
+el3_core_reset(void) "core reset"
+
+# 3c509.c
+isa_3c509_realize(uint16_t iobase, uint8_t irq) "iobase=0x%03x irq=%d"
+isa_3c509_reset(void) ""
+
+# 3c515.c
+isa_3c515_realize(uint16_t iobase, uint8_t irq, bool pnp) "iobase=0x%03x irq=%d pnp=%d"
+isa_3c515_reset(void) ""
+
+# MII/PHY operations
+el3_phy_init(uint32_t phy_id, uint16_t id1, uint16_t id2) "PHY initialized: ID=%u PHY_ID=%04x:%04x"
+el3_phy_read(uint8_t reg, uint16_t value) "PHY read reg %02x = 0x%04x"
+el3_phy_write(uint8_t reg, uint16_t value) "PHY write reg %02x = 0x%04x"
+el3_phy_reset(void) "PHY reset"
+el3_autoneg_restart(void) "Autonegotiation restarted"
+el3_autoneg_complete(int speed, const char *duplex, uint16_t caps) "Autoneg complete: %d Mbps %s-duplex, common_caps=0x%04x"
+el3_manual_config(int speed, const char *duplex) "Manual config: %d Mbps %s-duplex"
+el3_mii_command(const char *rw, uint8_t phy, uint8_t reg, uint16_t data) "MII %s PHY %d reg %d = 0x%04x"
+el3_mii_data_read(uint16_t data) "MII data read = 0x%04x"
+
+# Additional DMA trace events
+el3_dma_tx_processed(uint32_t addr) "TX descriptor 0x%06x processed"
+el3_dma_tx_complete(void) "TX chain complete"
+el3_dma_chain_limit(const char *direction, int limit) "%s chain reached limit (%d descriptors)"
+el3_dma_ring_advance(const char *direction) "%s ring advanced"
+el3_dma_ring_cleanup(const char *direction) "%s ring cleaned up"
+el3_dma_ring_set(uint64_t addr, uint32_t size) "DMA ring set: addr=0x%lx size=%u"
+el3_dma_start(bool is_tx, uint64_t addr) "DMA %s start: addr=0x%lx"
